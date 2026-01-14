@@ -140,6 +140,7 @@ def use_cheat(data: dict):
         return {"result": "invalid_code"}
 
     cheat = cheat_res.data[0]
+    cheat_id = cheat.get("id")
 
     if cheat.get("is_active") is not True:
         return {"result": "code_disabled"}
@@ -154,13 +155,13 @@ def use_cheat(data: dict):
 
     amount_limit = cheat.get("amount_limit", 0)
 
-    # 5. Check usage
+    # 5. Check usage (ใช้ cheat_id แทน code)
     usage_res = (
         supabase
         .table("cheatcode_usage")
         .select("*")
         .eq("member_email", email)
-        .eq("code", cheat_code)
+        .eq("cheat_id", cheat_id)
         .limit(1)
         .execute()
     )
@@ -174,13 +175,13 @@ def use_cheat(data: dict):
 
         supabase.table("cheatcode_usage").update({
             "used_count": used_count + 1
-        }).eq("member_email", email).eq("code", cheat_code).execute()
+        }).eq("member_email", email).eq("cheat_id", cheat_id).execute()
 
     else:
         if amount_limit > 0:
             supabase.table("cheatcode_usage").insert({
                 "member_email": email,
-                "code": cheat_code,
+                "cheat_id": cheat_id,
                 "used_count": 1
             }).execute()
         else:
