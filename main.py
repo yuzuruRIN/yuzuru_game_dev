@@ -68,7 +68,9 @@ def login(data: dict):
 
     return {
         "result": "ok",
-        "token": token
+        "token": token,
+        "username": member.get("username", "Supporter"),  # ✅ ส่ง username
+        "tier": member.get("tier", "Free")  # ✅ ส่ง tier
     }
 
 # =====================
@@ -88,6 +90,82 @@ def verify(data: dict):
     return {
         "result": "ok",
         "email": email
+    }
+
+# =====================
+# Get User History (✅ NEW ENDPOINT)
+# =====================
+@app.post("/get-history")
+def get_history(data: dict):
+    token = data.get("token")
+
+    if not token:
+        return {"result": "unauthorized"}
+
+    # Verify token
+    email = verify_token(token)
+    if not email:
+        return {"result": "unauthorized"}
+
+    # Check if user is banned
+    member_res = (
+        supabase
+        .table("member_list")
+        .select("blacklist, username, tier")
+        .eq("email", email)
+        .limit(1)
+        .execute()
+    )
+
+    if not member_res.data:
+        return {"result": "unauthorized"}
+
+    member = member_res.data[0]
+
+    if member.get("blacklist") is True:
+        return {"result": "banned"}
+
+    # Get usage history
+    usage_res = (
+        supabase
+        .table("cheatcode_usage")
+        .select("cheat_id, used_count")
+        .eq("member_email", email)
+        .execute()
+    )
+
+    # Get cheat code details
+    history = []
+    if usage_res.data:
+        for usage in usage_res.data:
+            cheat_id = usage.get("cheat_id")
+            used_count = usage.get("used_count", 0)
+
+            # Get cheat code info
+            cheat_res = (
+                supabase
+                .table("cheatcode_check_list")
+                .select("code, effect, amount_limit")
+                .eq("id", cheat_id)
+                .limit(1)
+                .execute()
+            )
+
+            if cheat_res.data:
+                cheat = cheat_res.data[0]
+                history.append({
+                    "code": cheat.get("code"),
+                    "effect": cheat.get("effect"),
+                    "used_count": used_count,
+                    "amount_limit": cheat.get("amount_limit", 0)
+                })
+
+    return {
+        "result": "ok",
+        "email": email,
+        "username": member.get("username", "Supporter"),
+        "tier": member.get("tier", "Free"),
+        "history": history
     }
 
 # =====================
