@@ -148,15 +148,21 @@ def fetch_patreon_members():
     }
 
     parsed_members = []
+    page_index = 0
 
     while True:
         resp = requests.get(url, headers=headers, params=params, timeout=60)
         resp.raise_for_status()
         payload = resp.json()
 
+        if "errors" in payload:
+            raise Exception(f"Patreon API errors: {payload['errors']}")
+
         data = payload.get("data", [])
         included = payload.get("included", [])
         included_map = build_included_map(included)
+
+        print(f"[Patreon Sync] page={page_index} members_on_page={len(data)} included={len(included)}")
 
         for member in data:
             row = parse_patreon_member(member, included_map)
@@ -169,6 +175,10 @@ def fetch_patreon_members():
 
         url = next_link
         params = None
+        page_index += 1
+
+    if len(parsed_members) == 0:
+        print("[Patreon Sync] WARNING: No members were returned from Patreon API")
 
     return parsed_members
 
@@ -228,18 +238,29 @@ def mark_missing_members_blacklisted(active_emails):
 def run_patreon_sync():
     members = fetch_patreon_members()
 
+    # ป้องกันกรณี API ส่งกลับว่างผิดปกติ
+    if len(members) == 0:
+        return {
+            "fetched_members": 0,
+            "upserted": 0,
+            "blacklisted_from_feed": 0,
+            "missing_blacklisted": 0,
+            "active_emails_count": 0,
+            "synced_at": now_iso(),
+            "warning": "No members returned from Patreon API. Blacklist update skipped."
+        }
+
     active_emails = set()
     upserted = 0
     blacklisted_from_feed = 0
 
     for member in members:
         email = member["email"]
-        
-        # If this is a developer email, skip updating them but mark as active
+
         if email in DEV_EMAILS:
             active_emails.add(email)
             continue
-            
+
         upsert_member(member)
         upserted += 1
 
