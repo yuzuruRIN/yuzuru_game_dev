@@ -19,6 +19,8 @@ PATREON_ACCESS_TOKEN = os.getenv("PATREON_ACCESS_TOKEN")
 PATREON_CAMPAIGN_ID = os.getenv("PATREON_CAMPAIGN_ID")
 SYNC_TOKEN = os.getenv("SYNC_TOKEN")
 
+DEV_EMAILS = ["lxpetitprixce@gmail.com", "devthelastyear@yuzuru.rin"]
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI()
@@ -55,17 +57,19 @@ def build_included_map(included):
 
 
 def is_member_active(patron_status, tier_titles, last_charge_status):
-    if patron_status != "active_patron":
+    # If patron_status is specifically reported by Patreon
+    if patron_status and patron_status != "active_patron":
         return False
 
-    if not tier_titles:
-        return False
-
+    # Check last charge status if available
     if last_charge_status:
         normalized = str(last_charge_status).strip().lower()
         if normalized not in ["paid", "pending"]:
             return False
 
+    # We removed the mandatory tier_titles check to avoid blacklisting
+    # patrons who might not have a specific tier title assigned.
+    
     return True
 
 
@@ -182,7 +186,7 @@ def mark_missing_members_blacklisted(active_emails):
     result = (
         supabase
         .table("member_list")
-        .select("email")
+        .select("email, tier")
         .execute()
     )
 
@@ -191,7 +195,17 @@ def mark_missing_members_blacklisted(active_emails):
 
     for row in rows:
         email = (row.get("email") or "").lower().strip()
+        tier = row.get("tier") or ""
+        
         if not email:
+            continue
+
+        # Skip developer emails
+        if email in DEV_EMAILS:
+            continue
+            
+        # Skip members with Donator tier
+        if "Donator" in tier:
             continue
 
         if email not in active_emails:
@@ -200,7 +214,7 @@ def mark_missing_members_blacklisted(active_emails):
                 .table("member_list")
                 .update({
                     "blacklist": True,
-                    "tier": "",
+                    # We no longer clear the 'tier' column here
                     "updated_at": now_iso()
                 })
                 .eq("email", email)
@@ -219,11 +233,18 @@ def run_patreon_sync():
     blacklisted_from_feed = 0
 
     for member in members:
+        email = member["email"]
+        
+        # If this is a developer email, skip updating them but mark as active
+        if email in DEV_EMAILS:
+            active_emails.add(email)
+            continue
+            
         upsert_member(member)
         upserted += 1
 
         if member["blacklist"] is False:
-            active_emails.add(member["email"])
+            active_emails.add(email)
         else:
             blacklisted_from_feed += 1
 
