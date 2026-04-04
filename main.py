@@ -91,14 +91,17 @@ def parse_patreon_member(member, included_map):
             if title:
                 tier_titles.append(title)
 
-    email = None
-    username = ""
+    # Try to get email and username from member attributes first
+    email = attrs.get("email")
+    username = attrs.get("full_name") or ""
     patreon_user_id = None
 
     if user_obj:
         user_attrs = user_obj.get("attributes", {})
-        email = user_attrs.get("email")
-        username = user_attrs.get("full_name") or user_attrs.get("vanity") or ""
+        if not email:
+            email = user_attrs.get("email")
+        if not username:
+            username = user_attrs.get("full_name") or user_attrs.get("vanity") or ""
         patreon_user_id = user_obj.get("id")
 
     if not email:
@@ -141,7 +144,7 @@ def fetch_patreon_members():
     }
     params = {
         "include": "user,currently_entitled_tiers",
-        "fields[member]": "patron_status,last_charge_status,next_charge_date",
+        "fields[member]": "email,full_name,patron_status,last_charge_status,next_charge_date",
         "fields[user]": "email,full_name,vanity",
         "fields[tier]": "title",
         "page[count]": 100
