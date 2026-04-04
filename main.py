@@ -104,6 +104,13 @@ def parse_patreon_member(member, included_map):
             username = user_attrs.get("full_name") or user_attrs.get("vanity") or ""
         patreon_user_id = user_obj.get("id")
 
+    # Filter out "Free" tiers and ensure common casing
+    active_tiers = [t for t in tier_titles if t.lower().strip() != "free"]
+
+    # If they only have "Free" or no tiers, skip them
+    if not active_tiers:
+        return None
+
     if not email:
         return None
 
@@ -113,14 +120,14 @@ def parse_patreon_member(member, included_map):
 
     active = is_member_active(
         patron_status=patron_status,
-        tier_titles=tier_titles,
+        tier_titles=active_tiers,
         last_charge_status=last_charge_status
     )
 
     return {
         "username": username,
         "email": email.lower().strip(),
-        "tier": ", ".join(tier_titles) if tier_titles else "",
+        "tier": active_tiers[-1],
         "blacklist": not active,
         "patreon_user_id": patreon_user_id,
         "patron_status": patron_status,
