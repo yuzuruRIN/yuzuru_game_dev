@@ -205,7 +205,7 @@ def upsert_member(member_row):
 
 
 def mark_missing_members_blacklisted(active_emails, db_map):
-    updated_count = 0
+    emails_to_blacklist = []
 
     for email, row in db_map.items():
         email = email.lower().strip()
@@ -215,21 +215,23 @@ def mark_missing_members_blacklisted(active_emails, db_map):
         if email in DEV_EMAILS or "Donator" in tier:
             continue
 
-        # Only touch those who are currently active in DB but missing from Patreon feed
+        # Collect emails of those who should be blacklisted
         if email not in active_emails and row.get("blacklist") is False:
-            (
-                supabase
-                .table("member_list")
-                .update({
-                    "blacklist": True,
-                    "updated_at": now_iso()
-                })
-                .eq("email", email)
-                .execute()
-            )
-            updated_count += 1
+            emails_to_blacklist.append(email)
 
-    return updated_count
+    if emails_to_blacklist:
+        (
+            supabase
+            .table("member_list")
+            .update({
+                "blacklist": True,
+                "updated_at": now_iso()
+            })
+            .in_("email", emails_to_blacklist)
+            .execute()
+        )
+
+    return len(emails_to_blacklist)
 
 
 def run_patreon_sync():
@@ -264,6 +266,8 @@ def run_patreon_sync():
     skipped_members = 0
     blacklisted_from_feed = 0
 
+    to_upsert = []
+
     for member in members:
         email = member["email"]
         active_emails.add(email)
@@ -292,11 +296,20 @@ def run_patreon_sync():
                 skipped_members += 1
 
         if should_update:
-            upsert_member(member)
+            to_upsert.append(member)
 
         # Count those who are already blacklisted in the feed
         if member["blacklist"] is True:
             blacklisted_from_feed += 1
+
+    # Bulk Upsert for new/updated members
+    if to_upsert:
+        (
+            supabase
+            .table("member_list")
+            .upsert(to_upsert, on_conflict="email")
+            .execute()
+        )
 
     missing_blacklisted = mark_missing_members_blacklisted(active_emails, db_map)
 
