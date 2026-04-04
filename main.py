@@ -1,7 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from supabase import create_client
 from jose import jwt, JWTError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import requests
 import os
 
 # =====================
@@ -13,6 +14,10 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_NOW")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 7
+
+PATREON_ACCESS_TOKEN = os.getenv("PATREON_ACCESS_TOKEN")
+PATREON_CAMPAIGN_ID = os.getenv("PATREON_CAMPAIGN_ID")
+SYNC_TOKEN = os.getenv("SYNC_TOKEN")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -37,6 +42,211 @@ def verify_token(token: str):
     except JWTError:
         return None
 
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# =====================
+# Patreon Sync Utils
+# =====================
+def build_included_map(included):
+    return {(item["type"], item["id"]): item for item in included}
+
+
+def is_member_active(patron_status, tier_titles, last_charge_status):
+    if patron_status != "active_patron":
+        return False
+
+    if not tier_titles:
+        return False
+
+    if last_charge_status:
+        normalized = str(last_charge_status).strip().lower()
+        if normalized not in ["paid", "pending"]:
+            return False
+
+    return True
+
+
+def parse_patreon_member(member, included_map):
+    attrs = member.get("attributes", {})
+    rels = member.get("relationships", {})
+
+    user_obj = None
+    user_rel = rels.get("user", {}).get("data")
+    if user_rel:
+        user_obj = included_map.get((user_rel["type"], user_rel["id"]))
+
+    tier_titles = []
+    entitled_tiers = rels.get("currently_entitled_tiers", {}).get("data", [])
+    for tier_ref in entitled_tiers:
+        tier_obj = included_map.get((tier_ref["type"], tier_ref["id"]))
+        if tier_obj:
+            title = tier_obj.get("attributes", {}).get("title")
+            if title:
+                tier_titles.append(title)
+
+    email = None
+    username = ""
+    patreon_user_id = None
+
+    if user_obj:
+        user_attrs = user_obj.get("attributes", {})
+        email = user_attrs.get("email")
+        username = user_attrs.get("full_name") or user_attrs.get("vanity") or ""
+        patreon_user_id = user_obj.get("id")
+
+    if not email:
+        return None
+
+    patron_status = attrs.get("patron_status")
+    last_charge_status = attrs.get("last_charge_status")
+    next_charge_date = attrs.get("next_charge_date")
+
+    active = is_member_active(
+        patron_status=patron_status,
+        tier_titles=tier_titles,
+        last_charge_status=last_charge_status
+    )
+
+    return {
+        "username": username,
+        "email": email.lower().strip(),
+        "tier": ", ".join(tier_titles) if tier_titles else "",
+        "blacklist": not active,
+        "patreon_user_id": patreon_user_id,
+        "patron_status": patron_status,
+        "last_charge_status": last_charge_status,
+        "next_charge_date": next_charge_date,
+        "updated_at": now_iso()
+    }
+
+
+def fetch_patreon_members():
+    if not PATREON_ACCESS_TOKEN:
+        raise Exception("Missing PATREON_ACCESS_TOKEN")
+
+    if not PATREON_CAMPAIGN_ID:
+        raise Exception("Missing PATREON_CAMPAIGN_ID")
+
+    url = f"https://www.patreon.com/api/oauth2/v2/campaigns/{PATREON_CAMPAIGN_ID}/members"
+    headers = {
+        "Authorization": f"Bearer {PATREON_ACCESS_TOKEN}",
+        "User-Agent": "PatreonSyncApp/1.0"
+    }
+    params = {
+        "include": "user,currently_entitled_tiers",
+        "fields[member]": "patron_status,last_charge_status,next_charge_date",
+        "fields[user]": "email,full_name,vanity",
+        "fields[tier]": "title",
+        "page[count]": 100
+    }
+
+    parsed_members = []
+
+    while True:
+        resp = requests.get(url, headers=headers, params=params, timeout=60)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        data = payload.get("data", [])
+        included = payload.get("included", [])
+        included_map = build_included_map(included)
+
+        for member in data:
+            row = parse_patreon_member(member, included_map)
+            if row:
+                parsed_members.append(row)
+
+        next_link = payload.get("links", {}).get("next")
+        if not next_link:
+            break
+
+        url = next_link
+        params = None
+
+    return parsed_members
+
+
+def upsert_member(member_row):
+    (
+        supabase
+        .table("member_list")
+        .upsert(member_row, on_conflict="email")
+        .execute()
+    )
+
+
+def mark_missing_members_blacklisted(active_emails):
+    result = (
+        supabase
+        .table("member_list")
+        .select("email")
+        .execute()
+    )
+
+    rows = result.data or []
+    updated_count = 0
+
+    for row in rows:
+        email = (row.get("email") or "").lower().strip()
+        if not email:
+            continue
+
+        if email not in active_emails:
+            (
+                supabase
+                .table("member_list")
+                .update({
+                    "blacklist": True,
+                    "tier": "",
+                    "updated_at": now_iso()
+                })
+                .eq("email", email)
+                .execute()
+            )
+            updated_count += 1
+
+    return updated_count
+
+
+def run_patreon_sync():
+    members = fetch_patreon_members()
+
+    active_emails = set()
+    upserted = 0
+    blacklisted_from_feed = 0
+
+    for member in members:
+        upsert_member(member)
+        upserted += 1
+
+        if member["blacklist"] is False:
+            active_emails.add(member["email"])
+        else:
+            blacklisted_from_feed += 1
+
+    missing_blacklisted = mark_missing_members_blacklisted(active_emails)
+
+    return {
+        "fetched_members": len(members),
+        "upserted": upserted,
+        "blacklisted_from_feed": blacklisted_from_feed,
+        "missing_blacklisted": missing_blacklisted,
+        "active_emails_count": len(active_emails),
+        "synced_at": now_iso()
+    }
+
+
+# =====================
+# Root
+# =====================
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+
 # =====================
 # Login
 # =====================
@@ -46,6 +256,8 @@ def login(data: dict):
 
     if not email:
         return {"result": "fail"}
+
+    email = email.lower().strip()
 
     res = (
         supabase
@@ -69,9 +281,10 @@ def login(data: dict):
     return {
         "result": "ok",
         "token": token,
-        "username": member.get("username", "Supporter"),  # ✅ ส่ง username
-        "tier": member.get("tier", "Free")  # ✅ ส่ง tier
+        "username": member.get("username", "Supporter"),
+        "tier": member.get("tier", "Free")
     }
+
 
 # =====================
 # Verify Token
@@ -92,8 +305,9 @@ def verify(data: dict):
         "email": email
     }
 
+
 # =====================
-# Get User History (✅ NEW ENDPOINT)
+# Get User History
 # =====================
 @app.post("/get-history")
 def get_history(data: dict):
@@ -102,12 +316,10 @@ def get_history(data: dict):
     if not token:
         return {"result": "unauthorized"}
 
-    # Verify token
     email = verify_token(token)
     if not email:
         return {"result": "unauthorized"}
 
-    # Check if user is banned
     member_res = (
         supabase
         .table("member_list")
@@ -125,7 +337,6 @@ def get_history(data: dict):
     if member.get("blacklist") is True:
         return {"result": "banned"}
 
-    # Get usage history
     usage_res = (
         supabase
         .table("cheatcode_usage")
@@ -134,14 +345,12 @@ def get_history(data: dict):
         .execute()
     )
 
-    # Get cheat code details
     history = []
     if usage_res.data:
         for usage in usage_res.data:
             cheat_id = usage.get("cheat_id")
             used_count = usage.get("used_count", 0)
 
-            # Get cheat code info
             cheat_res = (
                 supabase
                 .table("cheatcode_check_list")
@@ -168,6 +377,7 @@ def get_history(data: dict):
         "history": history
     }
 
+
 # =====================
 # Use Cheat Code
 # =====================
@@ -179,12 +389,10 @@ def use_cheat(data: dict):
     if not token or not cheat_code:
         return {"result": "fail"}
 
-    # 1. Verify token
     email = verify_token(token)
     if not email:
         return {"result": "unauthorized"}
 
-    # 2. Check member, blacklist, tier
     member_res = (
         supabase
         .table("member_list")
@@ -204,7 +412,6 @@ def use_cheat(data: dict):
 
     member_tier = member.get("tier")
 
-    # 3. Check cheat code exists & active
     cheat_res = (
         supabase
         .table("cheatcode_check_list")
@@ -223,17 +430,13 @@ def use_cheat(data: dict):
     if cheat.get("is_active") is not True:
         return {"result": "code_disabled"}
 
-    # 4. Check tier permission
     allowed_tiers = cheat.get("allowed_tiers", [])
 
     if allowed_tiers and member_tier not in allowed_tiers:
-        return {
-            "result": "tier_not_allowed"
-        }
+        return {"result": "tier_not_allowed"}
 
     amount_limit = cheat.get("amount_limit", 0)
 
-    # 5. Check usage (ใช้ cheat_id แทน code)
     usage_res = (
         supabase
         .table("cheatcode_usage")
@@ -270,3 +473,23 @@ def use_cheat(data: dict):
         "effect": cheat.get("effect"),
         "payload": cheat.get("payload")
     }
+
+
+# =====================
+# Patreon Sync Endpoint
+# =====================
+@app.get("/sync-patreon-members")
+def sync_patreon_members(token: str = Query(...)):
+    if not SYNC_TOKEN or token != SYNC_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        result = run_patreon_sync()
+        return {
+            "status": "ok",
+            "result": result
+        }
+    except requests.HTTPError as e:
+        raise HTTPException(status_code=500, detail=f"Patreon HTTP error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
