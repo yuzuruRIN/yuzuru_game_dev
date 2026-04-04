@@ -150,6 +150,7 @@ def fetch_patreon_members():
     parsed_members = []
     page_index = 0
 
+    raw_count = 0
     while True:
         resp = requests.get(url, headers=headers, params=params, timeout=60)
         resp.raise_for_status()
@@ -159,6 +160,7 @@ def fetch_patreon_members():
             raise Exception(f"Patreon API errors: {payload['errors']}")
 
         data = payload.get("data", [])
+        raw_count += len(data)
         included = payload.get("included", [])
         included_map = build_included_map(included)
 
@@ -178,9 +180,9 @@ def fetch_patreon_members():
         page_index += 1
 
     if len(parsed_members) == 0:
-        print("[Patreon Sync] WARNING: No members were returned from Patreon API")
+        print(f"[Patreon Sync] WARNING: No members were parsed (Total raw from API: {raw_count})")
 
-    return parsed_members
+    return parsed_members, raw_count
 
 
 def upsert_member(member_row):
@@ -236,18 +238,19 @@ def mark_missing_members_blacklisted(active_emails):
 
 
 def run_patreon_sync():
-    members = fetch_patreon_members()
+    members, total_raw = fetch_patreon_members()
 
     # ป้องกันกรณี API ส่งกลับว่างผิดปกติ
-    if len(members) == 0:
+    if total_raw == 0:
         return {
+            "total_raw_from_api": 0,
             "fetched_members": 0,
             "upserted": 0,
             "blacklisted_from_feed": 0,
             "missing_blacklisted": 0,
             "active_emails_count": 0,
             "synced_at": now_iso(),
-            "warning": "No members returned from Patreon API. Blacklist update skipped."
+            "warning": "No members returned from Patreon API. Check if CAMPAIGN_ID is correct."
         }
 
     active_emails = set()
@@ -272,6 +275,7 @@ def run_patreon_sync():
     missing_blacklisted = mark_missing_members_blacklisted(active_emails)
 
     return {
+        "total_raw_from_api": total_raw,
         "fetched_members": len(members),
         "upserted": upserted,
         "blacklisted_from_feed": blacklisted_from_feed,

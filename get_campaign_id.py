@@ -1,6 +1,6 @@
 import requests
 
-PATREON_ACCESS_TOKEN = ""
+PATREON_ACCESS_TOKEN = "ใส่ access token ของคุณตรงนี้"
 
 url = "https://www.patreon.com/api/oauth2/v2/campaigns"
 headers = {
