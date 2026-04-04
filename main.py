@@ -204,39 +204,24 @@ def upsert_member(member_row):
     )
 
 
-def mark_missing_members_blacklisted(active_emails):
-    result = (
-        supabase
-        .table("member_list")
-        .select("email, tier")
-        .execute()
-    )
-
-    rows = result.data or []
+def mark_missing_members_blacklisted(active_emails, db_map):
     updated_count = 0
 
-    for row in rows:
-        email = (row.get("email") or "").lower().strip()
+    for email, row in db_map.items():
+        email = email.lower().strip()
         tier = row.get("tier") or ""
         
-        if not email:
+        # Skip dev/donator
+        if email in DEV_EMAILS or "Donator" in tier:
             continue
 
-        # Skip developer emails
-        if email in DEV_EMAILS:
-            continue
-            
-        # Skip members with Donator tier
-        if "Donator" in tier:
-            continue
-
-        if email not in active_emails:
+        # Only touch those who are currently active in DB but missing from Patreon feed
+        if email not in active_emails and row.get("blacklist") is False:
             (
                 supabase
                 .table("member_list")
                 .update({
                     "blacklist": True,
-                    # We no longer clear the 'tier' column here
                     "updated_at": now_iso()
                 })
                 .eq("email", email)
@@ -248,9 +233,19 @@ def mark_missing_members_blacklisted(active_emails):
 
 
 def run_patreon_sync():
+    # 1. Fetch from Patreon
     members, total_raw = fetch_patreon_members()
 
-    # ป้องกันกรณี API ส่งกลับว่างผิดปกติ
+    # 2. Fetch only necessary columns for comparison
+    res = (
+        supabase
+        .table("member_list")
+        .select("email, username, tier, blacklist, patron_status, last_charge_status, next_charge_date")
+        .execute()
+    )
+    db_map = {row["email"].lower().strip(): row for row in res.data} if res.data else {}
+
+    # Warning if Patreon returns nothing
     if total_raw == 0:
         return {
             "total_raw_from_api": 0,
@@ -264,33 +259,55 @@ def run_patreon_sync():
         }
 
     active_emails = set()
-    upserted = 0
+    new_subscribers = 0
+    updated_members = 0
+    skipped_members = 0
     blacklisted_from_feed = 0
 
     for member in members:
         email = member["email"]
+        active_emails.add(email)
 
         if email in DEV_EMAILS:
-            active_emails.add(email)
             continue
 
-        upsert_member(member)
-        upserted += 1
-
-        if member["blacklist"] is False:
-            active_emails.add(email)
+        # Comparison Logic
+        existing = db_map.get(email)
+        should_update = False
+        
+        if not existing:
+            should_update = True
+            new_subscribers += 1
         else:
+            # Check for changes in key fields
+            check_fields = ["username", "tier", "blacklist", "patron_status", "last_charge_status", "next_charge_date"]
+            for f in check_fields:
+                if str(member.get(f)) != str(existing.get(f)):
+                    should_update = True
+                    break
+            
+            if should_update:
+                updated_members += 1
+            else:
+                skipped_members += 1
+
+        if should_update:
+            upsert_member(member)
+
+        # Count those who are already blacklisted in the feed
+        if member["blacklist"] is True:
             blacklisted_from_feed += 1
 
-    missing_blacklisted = mark_missing_members_blacklisted(active_emails)
+    missing_blacklisted = mark_missing_members_blacklisted(active_emails, db_map)
 
     return {
         "total_raw_from_api": total_raw,
-        "fetched_members": len(members),
-        "upserted": upserted,
+        "new_subscribers": new_subscribers,
+        "updated_members": updated_members,
+        "skipped_members": skipped_members,
         "blacklisted_from_feed": blacklisted_from_feed,
-        "missing_blacklisted": missing_blacklisted,
-        "active_emails_count": len(active_emails),
+        "new_blacklisted_members": missing_blacklisted,
+        "active_emails_count": len(members), # Total in Patreon feed
         "synced_at": now_iso()
     }
 
