@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi.responses import HTMLResponse
 import csv
 import io
 from supabase import create_client
@@ -738,3 +739,186 @@ async def import_patreon_csv(token: str = Query(...), file: UploadFile = File(..
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"CSV import failed: {str(e)}")
+
+
+# =====================
+# UI Upload Page
+# =====================
+
+@app.get("/upload", response_class=HTMLResponse)
+async def upload_page():
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Patreon CSV Import</title>
+        <style>
+            :root {
+                --primary: #FF424D;
+                --bg: #0F172A;
+                --card: #1E293B;
+                --text: #F8FAFC;
+                --accent: #38BDF8;
+            }
+            body { 
+                font-family: 'Inter', -apple-system, sans-serif;
+                background-color: var(--bg);
+                color: var(--text);
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                min-height: 100vh;
+                margin: 0;
+            }
+            .container {
+                background: var(--card);
+                padding: 2.5rem;
+                border-radius: 1.5rem;
+                box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+                width: 90%;
+                max-width: 500px;
+                text-align: center;
+                border: 1px solid rgba(255,255,255,0.1);
+            }
+            h2 { color: var(--primary); margin-bottom: 0.5rem; font-size: 1.8rem; }
+            p { color: #94A3B8; font-size: 0.95rem; margin-bottom: 2.5rem; line-height: 1.5; }
+            
+            .form-group { margin-bottom: 2rem; text-align: left; }
+            label { display: block; margin-bottom: 0.75rem; font-weight: 600; color: #CBD5E1; font-size: 0.9rem; letter-spacing: 0.05rem; }
+            
+            input[type="text"], input[type="file"] {
+                width: 100%;
+                padding: 0.85rem;
+                border-radius: 0.75rem;
+                border: 2px solid #334155;
+                background: #0F172A;
+                color: white;
+                box-sizing: border-box;
+                transition: border-color 0.2s;
+            }
+            input[type="text"]:focus { outline: none; border-color: var(--primary); }
+            
+            button {
+                background: var(--primary);
+                color: white;
+                border: none;
+                padding: 1.1rem;
+                border-radius: 0.75rem;
+                font-weight: 700;
+                font-size: 1rem;
+                cursor: pointer;
+                width: 100%;
+                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+                margin-top: 1rem;
+                box-shadow: 0 4px 14px rgba(255, 66, 77, 0.4);
+            }
+            button:hover { opacity: 0.9; transform: translateY(-3px); box-shadow: 0 6px 20px rgba(255, 66, 77, 0.5); }
+            button:active { transform: translateY(-1px); }
+            button:disabled { background: #475569; cursor: not-allowed; box-shadow: none; transform: none; }
+            
+            #result {
+                margin-top: 2.5rem;
+                text-align: left;
+                padding: 1.25rem;
+                border-radius: 1rem;
+                background: rgba(0,0,0,0.4);
+                display: none;
+                font-size: 0.9rem;
+                line-height: 1.7;
+                max-height: 300px;
+                overflow-y: auto;
+                border: 1px solid #334155;
+                animation: fadeIn 0.4s ease-out;
+            }
+            @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+            
+            .stat-line { display: flex; justify-content: space-between; margin-bottom: 0.5rem; padding-bottom: 0.5rem; border-bottom: 1px solid rgba(255,255,255,0.05); }
+            .stat-val { color: var(--accent); font-weight: 700; }
+            .tier-list { margin-top: 1rem; }
+            .tier-item { background: rgba(252, 211, 77, 0.1); padding: 0.5rem; border-radius: 0.5rem; font-size: 0.8rem; margin-bottom: 0.5rem; color: #FDE68A; border: 1px solid rgba(252, 211, 77, 0.2); }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>Patreon CSV Import</h2>
+            <p>Upload members CSV from Relationship Manager<br>to sync with Supabase</p>
+            
+            <div class="form-group">
+                <label>SYNC TOKEN</label>
+                <input type="text" id="token" placeholder="Enter sync token...">
+            </div>
+            
+            <div class="form-group">
+                <label>CSV FILE</label>
+                <input type="file" id="csvFile" accept=".csv">
+            </div>
+            
+            <button id="uploadBtn" onclick="handleUpload()">SYNC MEMBERS</button>
+            
+            <div id="result"></div>
+        </div>
+
+        <script>
+            async function handleUpload() {
+                const token = document.getElementById('token').value;
+                const fileInput = document.getElementById('csvFile');
+                const resultDiv = document.getElementById('result');
+                const btn = document.getElementById('uploadBtn');
+
+                if (!token || !fileInput.files[0]) {
+                    alert('Please provide Token and File');
+                    return;
+                }
+
+                btn.disabled = true;
+                btn.innerText = 'SYNCING DATA...';
+                resultDiv.style.display = 'none';
+
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+
+                try {
+                    const response = await fetch(`/import-patreon-csv?token=${token}`, {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    const data = await response.json();
+                    btn.disabled = false;
+                    btn.innerText = 'SYNC MEMBERS';
+                    resultDiv.style.display = 'block';
+
+                    if (response.ok) {
+                        const res = data.result;
+                        let logHtml = `<div style="color:#4ADE80; font-weight:bold; margin-bottom:1rem;">✅ SYNC COMPLETED</div>`;
+                        logHtml += `<div class="stat-line"><span>New Subscribers</span><span class="stat-val">${res.new_subscribers}</span></div>`;
+                        logHtml += `<div class="stat-line"><span>Updated Members</span><span class="stat-val">${res.updated_members}</span></div>`;
+                        logHtml += `<div class="stat-line"><span>Unchanged</span><span class="stat-val">${res.skipped_members}</span></div>`;
+                        logHtml += `<div class="stat-line"><span>Blacklisted (Gone)</span><span class="stat-val">${res.new_blacklisted_members}</span></div>`;
+                        
+                        if (res.changed_details.length > 0) {
+                            logHtml += `<div class="tier-list"><b>⚠️ TIER CHANGES DETECTED:</b>`;
+                            res.changed_details.forEach(item => {
+                                logHtml += `<div class="tier-item"><b>${item.username}</b>: ${item.old_tier} ➔ ${item.new_tier}</div>`;
+                            });
+                            logHtml += `</div>`;
+                        }
+                        resultDiv.innerHTML = logHtml;
+                    } else {
+                        resultDiv.innerHTML = `<span style="color:#F87171">❌ Error: ${data.detail || 'Sync Failed'}</span>`;
+                    }
+                } catch (error) {
+                    btn.disabled = false;
+                    btn.innerText = 'SYNC MEMBERS';
+                    resultDiv.style.display = 'block';
+                    resultDiv.innerHTML = `<span style="color:#F87171">❌ Connection Error: ${error.message}</span>`;
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return html_content
