@@ -267,6 +267,7 @@ def run_patreon_sync():
     blacklisted_from_feed = 0
 
     to_upsert = []
+    changed_details = []
 
     for member in members:
         email = member["email"]
@@ -285,13 +286,28 @@ def run_patreon_sync():
         else:
             # Check for changes in key fields
             check_fields = ["username", "tier", "blacklist", "patron_status", "last_charge_status", "next_charge_date"]
+            changes = {}
             for f in check_fields:
-                if str(member.get(f)) != str(existing.get(f)):
+                val_new = member.get(f)
+                val_old = existing.get(f)
+                
+                # Treat None as empty string for string fields to avoid false positive changes
+                if val_new is None and isinstance(val_old, str) and val_old == "":
+                    val_new = ""
+                if val_old is None and isinstance(val_new, str) and val_new == "":
+                    val_old = ""
+
+                if str(val_new) != str(val_old):
                     should_update = True
-                    break
+                    changes[f] = {"old": val_old, "new": val_new}
             
             if should_update:
                 updated_members += 1
+                changed_details.append({
+                    "username": member.get("username", ""),
+                    "email": email,
+                    "changes": changes
+                })
             else:
                 skipped_members += 1
 
@@ -321,8 +337,10 @@ def run_patreon_sync():
         "blacklisted_from_feed": blacklisted_from_feed,
         "new_blacklisted_members": missing_blacklisted,
         "active_emails_count": len(members), # Total in Patreon feed
+        "changed_details": changed_details,
         "synced_at": now_iso()
     }
+
 
 
 # =====================
