@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+import csv
+import io
 from supabase import create_client
 from jose import jwt, JWTError
 from datetime import datetime, timedelta, timezone
@@ -303,11 +305,14 @@ def run_patreon_sync():
             
             if should_update:
                 updated_members += 1
-                changed_details.append({
-                    "username": member.get("username", ""),
-                    "email": email,
-                    "changes": changes
-                })
+                # Only log details if the TIER specifically changed
+                if "tier" in changes:
+                    changed_details.append({
+                        "username": member.get("username", ""),
+                        "email": email,
+                        "old_tier": changes["tier"]["old"],
+                        "new_tier": changes["tier"]["new"]
+                    })
             else:
                 skipped_members += 1
 
@@ -597,3 +602,139 @@ def sync_patreon_members(token: str = Query(...)):
         raise HTTPException(status_code=500, detail=f"Patreon HTTP error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
+
+
+# =====================
+# CSV Import Utils
+# =====================
+
+def process_patreon_csv(csv_content: str):
+    # Fetch existing members for comparison
+    res = (
+        supabase
+        .table("member_list")
+        .select("email, username, tier, blacklist, patron_status, last_charge_status, next_charge_date")
+        .execute()
+    )
+    db_map = {row["email"].lower().strip(): row for row in res.data} if res.data else {}
+
+    f = io.StringIO(csv_content)
+    reader = csv.DictReader(f)
+    
+    active_emails = set()
+    new_subscribers = 0
+    updated_members = 0
+    skipped_members = 0
+    to_upsert = []
+    changed_details = []
+
+    for row in reader:
+        # Headers from Patreon Audience CSV
+        email = (row.get("Email") or "").lower().strip()
+        name = row.get("Name") or ""
+        tier = row.get("Tier") or ""
+        patron_status_raw = row.get("Patron Status") or ""
+        last_charge_status = row.get("Last Charge Status") or ""
+        next_charge_date = row.get("Next Charge Date") or ""
+        is_free_member = (row.get("Free Member") or "").lower() == "yes"
+
+        # Filter out Free members or missing data
+        if not email or is_free_member or not tier or tier.lower() == "free":
+            continue
+
+        active_emails.add(email)
+        
+        # Convert "Active patron" to "active_patron" etc.
+        patron_status = patron_status_raw.lower().replace(" ", "_").strip()
+
+        is_active = is_member_active(
+            patron_status=patron_status,
+            tier_titles=[tier],
+            last_charge_status=last_charge_status
+        )
+
+        member_data = {
+            "username": name,
+            "email": email,
+            "tier": tier,
+            "blacklist": not is_active,
+            "patron_status": patron_status,
+            "last_charge_status": last_charge_status,
+            "next_charge_date": next_charge_date,
+            "updated_at": now_iso()
+        }
+
+        if email in DEV_EMAILS:
+            continue
+
+        # Comparison Logic
+        existing = db_map.get(email)
+        should_update = False
+        
+        if not existing:
+            should_update = True
+            new_subscribers += 1
+        else:
+            check_fields = ["username", "tier", "blacklist", "patron_status", "last_charge_status", "next_charge_date"]
+            changes = {}
+            for f_name in check_fields:
+                val_new = member_data.get(f_name)
+                val_old = existing.get(f_name)
+                
+                if val_new is None and isinstance(val_old, str) and val_old == "":
+                    val_new = ""
+                if val_old is None and isinstance(val_new, str) and val_new == "":
+                    val_old = ""
+
+                if str(val_new) != str(val_old):
+                    should_update = True
+                    changes[f_name] = {"old": val_old, "new": val_new}
+            
+            if should_update:
+                updated_members += 1
+                if "tier" in changes:
+                    changed_details.append({
+                        "username": name,
+                        "email": email,
+                        "old_tier": changes["tier"]["old"],
+                        "new_tier": changes["tier"]["new"]
+                    })
+            else:
+                skipped_members += 1
+
+        if should_update:
+            to_upsert.append(member_data)
+
+    if to_upsert:
+        supabase.table("member_list").upsert(to_upsert, on_conflict="email").execute()
+
+    missing_blacklisted = mark_missing_members_blacklisted(active_emails, db_map)
+
+    return {
+        "new_subscribers": new_subscribers,
+        "updated_members": updated_members,
+        "skipped_members": skipped_members,
+        "new_blacklisted_members": missing_blacklisted,
+        "changed_details": changed_details,
+        "synced_at": now_iso()
+    }
+
+
+@app.post("/import-patreon-csv")
+async def import_patreon_csv(token: str = Query(...), file: UploadFile = File(...)):
+    if not SYNC_TOKEN or token != SYNC_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Only CSV files are allowed")
+
+    try:
+        content = await file.read()
+        decoded_content = content.decode("utf-8")
+        result = process_patreon_csv(decoded_content)
+        return {
+            "status": "ok",
+            "result": result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CSV import failed: {str(e)}")
