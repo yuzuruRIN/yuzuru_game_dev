@@ -636,7 +636,7 @@ def process_patreon_csv(csv_content: str):
         tier = row.get("Tier") or ""
         patron_status_raw = row.get("Patron Status") or ""
         last_charge_status = row.get("Last Charge Status") or ""
-        next_charge_date = row.get("Next Charge Date") or ""
+        next_charge_date = row.get("Next Charge Date") or None
         is_free_member = (row.get("Free Member") or "").lower() == "yes"
 
         # Filter out Free members or missing data
