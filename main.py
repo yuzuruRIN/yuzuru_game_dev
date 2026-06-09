@@ -721,6 +721,105 @@ def process_patreon_csv(csv_content: str):
     }
 
 
+def process_gsheet_csv(csv_content: str):
+    today = datetime.now(timezone.utc).date()
+
+    res = (
+        supabase
+        .table("member_list")
+        .select("email, blacklist")
+        .execute()
+    )
+    db_map = {row["email"].lower().strip(): row for row in res.data} if res.data else {}
+
+    f = io.StringIO(csv_content)
+    reader = csv.DictReader(f)
+
+    new_subscribers = 0
+    newly_blacklisted = 0
+    reactivated_members = 0
+    skipped_members = 0
+    to_insert = []
+    to_blacklist = []
+    to_reactivate = []
+
+    for row in reader:
+        name = (row.get("Name") or "").strip()
+        end_date_str = (row.get("End Date") or "").strip()
+
+        if not name or not end_date_str:
+            continue
+
+        email = f"{name}@donator.discord".lower()
+
+        try:
+            end_date = datetime.strptime(end_date_str, "%d/%m/%Y").date()
+        except ValueError:
+            continue
+
+        is_expired = end_date < today
+        existing = db_map.get(email)
+
+        if not existing:
+            new_subscribers += 1
+            to_insert.append({
+                "username": name,
+                "email": email,
+                "tier": "Donator",
+                "blacklist": is_expired,
+                "updated_at": now_iso()
+            })
+        else:
+            currently_blacklisted = existing.get("blacklist") is True
+            if is_expired and not currently_blacklisted:
+                newly_blacklisted += 1
+                to_blacklist.append(email)
+            elif not is_expired and currently_blacklisted:
+                reactivated_members += 1
+                to_reactivate.append(email)
+            else:
+                skipped_members += 1
+
+    now = now_iso()
+
+    if to_insert:
+        supabase.table("member_list").insert(to_insert).execute()
+
+    if to_blacklist:
+        supabase.table("member_list").update({"blacklist": True, "updated_at": now}).in_("email", to_blacklist).execute()
+
+    if to_reactivate:
+        supabase.table("member_list").update({"blacklist": False, "updated_at": now}).in_("email", to_reactivate).execute()
+
+    return {
+        "new_subscribers": new_subscribers,
+        "newly_blacklisted": newly_blacklisted,
+        "reactivated_members": reactivated_members,
+        "skipped_members": skipped_members,
+        "synced_at": now
+    }
+
+
+@app.post("/import-gsheet-csv")
+async def import_gsheet_csv(token: str = Query(...), file: UploadFile = File(...)):
+    if not SYNC_TOKEN or token != SYNC_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Only CSV files are allowed")
+
+    try:
+        content = await file.read()
+        decoded_content = content.decode("utf-8-sig")
+        result = process_gsheet_csv(decoded_content)
+        return {
+            "status": "ok",
+            "result": result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GSheet CSV import failed: {str(e)}")
+
+
 @app.post("/import-patreon-csv")
 async def import_patreon_csv(token: str = Query(...), file: UploadFile = File(...)):
     if not SYNC_TOKEN or token != SYNC_TOKEN:
@@ -753,16 +852,19 @@ async def upload_page():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Patreon CSV Import</title>
+        <title>Member CSV Import</title>
         <style>
             :root {
                 --primary: #FF424D;
+                --green: #34D399;
                 --bg: #0F172A;
                 --card: #1E293B;
                 --text: #F8FAFC;
                 --accent: #38BDF8;
+                --tab-active-patreon: #FF424D;
+                --tab-active-gsheet: #34D399;
             }
-            body { 
+            body {
                 font-family: 'Inter', -apple-system, sans-serif;
                 background-color: var(--bg);
                 color: var(--text);
@@ -779,16 +881,53 @@ async def upload_page():
                 border-radius: 1.5rem;
                 box-shadow: 0 10px 25px rgba(0,0,0,0.5);
                 width: 90%;
-                max-width: 500px;
+                max-width: 520px;
                 text-align: center;
                 border: 1px solid rgba(255,255,255,0.1);
             }
-            h2 { color: var(--primary); margin-bottom: 0.5rem; font-size: 1.8rem; }
-            p { color: #94A3B8; font-size: 0.95rem; margin-bottom: 2.5rem; line-height: 1.5; }
-            
-            .form-group { margin-bottom: 2rem; text-align: left; }
-            label { display: block; margin-bottom: 0.75rem; font-weight: 600; color: #CBD5E1; font-size: 0.9rem; letter-spacing: 0.05rem; }
-            
+            h2 { margin-bottom: 0.25rem; font-size: 1.8rem; }
+            .subtitle { color: #94A3B8; font-size: 0.9rem; margin-bottom: 1.75rem; line-height: 1.5; }
+
+            .tabs {
+                display: flex;
+                border-radius: 0.75rem;
+                background: #0F172A;
+                padding: 0.25rem;
+                margin-bottom: 2rem;
+                gap: 0.25rem;
+            }
+            .tab-btn {
+                flex: 1;
+                padding: 0.7rem;
+                border: none;
+                border-radius: 0.6rem;
+                font-weight: 700;
+                font-size: 0.85rem;
+                cursor: pointer;
+                background: transparent;
+                color: #64748B;
+                transition: all 0.25s;
+                margin-top: 0;
+                box-shadow: none;
+                width: auto;
+            }
+            .tab-btn.active-patreon {
+                background: var(--tab-active-patreon);
+                color: white;
+                box-shadow: 0 2px 10px rgba(255,66,77,0.4);
+            }
+            .tab-btn.active-gsheet {
+                background: var(--tab-active-gsheet);
+                color: white;
+                box-shadow: 0 2px 10px rgba(52,211,153,0.4);
+            }
+
+            .tab-panel { display: none; }
+            .tab-panel.active { display: block; }
+
+            .form-group { margin-bottom: 1.5rem; text-align: left; }
+            label { display: block; margin-bottom: 0.6rem; font-weight: 600; color: #CBD5E1; font-size: 0.85rem; letter-spacing: 0.05rem; }
+
             input[type="text"], input[type="file"] {
                 width: 100%;
                 padding: 0.85rem;
@@ -800,9 +939,10 @@ async def upload_page():
                 transition: border-color 0.2s;
             }
             input[type="text"]:focus { outline: none; border-color: var(--primary); }
-            
-            button {
-                background: var(--primary);
+
+            .hint { font-size: 0.78rem; color: #64748B; margin-top: 0.4rem; }
+
+            button.submit-btn {
                 color: white;
                 border: none;
                 padding: 1.1rem;
@@ -812,21 +952,29 @@ async def upload_page():
                 cursor: pointer;
                 width: 100%;
                 transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-                margin-top: 1rem;
-                box-shadow: 0 4px 14px rgba(255, 66, 77, 0.4);
+                margin-top: 0.5rem;
             }
-            button:hover { opacity: 0.9; transform: translateY(-3px); box-shadow: 0 6px 20px rgba(255, 66, 77, 0.5); }
-            button:active { transform: translateY(-1px); }
-            button:disabled { background: #475569; cursor: not-allowed; box-shadow: none; transform: none; }
-            
-            #result {
-                margin-top: 2.5rem;
+            button.submit-btn.patreon-btn {
+                background: var(--primary);
+                box-shadow: 0 4px 14px rgba(255,66,77,0.4);
+            }
+            button.submit-btn.gsheet-btn {
+                background: var(--green);
+                color: #0F172A;
+                box-shadow: 0 4px 14px rgba(52,211,153,0.4);
+            }
+            button.submit-btn:hover { opacity: 0.9; transform: translateY(-3px); }
+            button.submit-btn:active { transform: translateY(-1px); }
+            button.submit-btn:disabled { background: #475569; color: #94A3B8; cursor: not-allowed; box-shadow: none; transform: none; }
+
+            .result-box {
+                margin-top: 2rem;
                 text-align: left;
                 padding: 1.25rem;
                 border-radius: 1rem;
                 background: rgba(0,0,0,0.4);
                 display: none;
-                font-size: 0.9rem;
+                font-size: 0.88rem;
                 line-height: 1.7;
                 max-height: 300px;
                 overflow-y: auto;
@@ -834,88 +982,148 @@ async def upload_page():
                 animation: fadeIn 0.4s ease-out;
             }
             @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-            
             .stat-line { display: flex; justify-content: space-between; margin-bottom: 0.5rem; padding-bottom: 0.5rem; border-bottom: 1px solid rgba(255,255,255,0.05); }
             .stat-val { color: var(--accent); font-weight: 700; }
             .tier-list { margin-top: 1rem; }
-            .tier-item { background: rgba(252, 211, 77, 0.1); padding: 0.5rem; border-radius: 0.5rem; font-size: 0.8rem; margin-bottom: 0.5rem; color: #FDE68A; border: 1px solid rgba(252, 211, 77, 0.2); }
+            .tier-item { background: rgba(252,211,77,0.1); padding: 0.5rem; border-radius: 0.5rem; font-size: 0.8rem; margin-bottom: 0.5rem; color: #FDE68A; border: 1px solid rgba(252,211,77,0.2); }
         </style>
     </head>
     <body>
         <div class="container">
-            <h2>Patreon CSV Import</h2>
-            <p>Upload members CSV from Relationship Manager<br>to sync with Supabase</p>
-            
-            <div class="form-group">
-                <label>SYNC TOKEN</label>
-                <input type="text" id="token" placeholder="Enter sync token...">
+            <h2 id="page-title" style="color: var(--primary);">Patreon CSV Import</h2>
+            <p class="subtitle" id="page-subtitle">Upload members CSV from Relationship Manager<br>to sync with Supabase</p>
+
+            <div class="tabs">
+                <button class="tab-btn active-patreon" onclick="switchTab('patreon')">🎖 PATREON</button>
+                <button class="tab-btn" onclick="switchTab('gsheet')">📊 GOOGLE SHEET</button>
             </div>
-            
-            <div class="form-group">
-                <label>CSV FILE</label>
-                <input type="file" id="csvFile" accept=".csv">
+
+            <!-- Patreon Tab -->
+            <div id="tab-patreon" class="tab-panel active">
+                <div class="form-group">
+                    <label>SYNC TOKEN</label>
+                    <input type="text" id="patreon-token" placeholder="Enter sync token...">
+                </div>
+                <div class="form-group">
+                    <label>CSV FILE</label>
+                    <input type="file" id="patreon-file" accept=".csv">
+                    <p class="hint">Export from Patreon Relationship Manager</p>
+                </div>
+                <button class="submit-btn patreon-btn" id="patreon-btn" onclick="handlePatreonUpload()">SYNC MEMBERS</button>
+                <div class="result-box" id="patreon-result"></div>
             </div>
-            
-            <button id="uploadBtn" onclick="handleUpload()">SYNC MEMBERS</button>
-            
-            <div id="result"></div>
+
+            <!-- Google Sheet Tab -->
+            <div id="tab-gsheet" class="tab-panel">
+                <div class="form-group">
+                    <label>SYNC TOKEN</label>
+                    <input type="text" id="gsheet-token" placeholder="Enter sync token...">
+                </div>
+                <div class="form-group">
+                    <label>CSV FILE</label>
+                    <input type="file" id="gsheet-file" accept=".csv">
+                    <p class="hint">Export Google Sheet as CSV (File → Download → CSV)</p>
+                </div>
+                <button class="submit-btn gsheet-btn" id="gsheet-btn" onclick="handleGSheetUpload()">SYNC DONATORS</button>
+                <div class="result-box" id="gsheet-result"></div>
+            </div>
         </div>
 
         <script>
-            async function handleUpload() {
-                const token = document.getElementById('token').value;
-                const fileInput = document.getElementById('csvFile');
-                const resultDiv = document.getElementById('result');
-                const btn = document.getElementById('uploadBtn');
+            const tabs = ['patreon', 'gsheet'];
+            const tabMeta = {
+                patreon: { title: 'Patreon CSV Import', subtitle: 'Upload members CSV from Relationship Manager<br>to sync with Supabase', color: 'var(--primary)', activeClass: 'active-patreon' },
+                gsheet:  { title: 'Google Sheet Import', subtitle: 'Upload donator list exported from Google Sheet<br>Email will be set as name@donator.discord', color: 'var(--green)', activeClass: 'active-gsheet' }
+            };
 
-                if (!token || !fileInput.files[0]) {
-                    alert('Please provide Token and File');
-                    return;
-                }
+            function switchTab(tab) {
+                tabs.forEach(t => {
+                    document.getElementById('tab-' + t).classList.remove('active');
+                    document.querySelectorAll('.tab-btn')[tabs.indexOf(t)].className = 'tab-btn';
+                });
+                document.getElementById('tab-' + tab).classList.add('active');
+                const btn = document.querySelectorAll('.tab-btn')[tabs.indexOf(tab)];
+                btn.classList.add(tabMeta[tab].activeClass);
+                document.getElementById('page-title').textContent = tabMeta[tab].title;
+                document.getElementById('page-title').style.color = tabMeta[tab].color;
+                document.getElementById('page-subtitle').innerHTML = tabMeta[tab].subtitle;
+            }
 
-                btn.disabled = true;
-                btn.innerText = 'SYNCING DATA...';
-                resultDiv.style.display = 'none';
+            async function handlePatreonUpload() {
+                const token = document.getElementById('patreon-token').value;
+                const fileInput = document.getElementById('patreon-file');
+                const resultDiv = document.getElementById('patreon-result');
+                const btn = document.getElementById('patreon-btn');
 
+                if (!token || !fileInput.files[0]) { alert('Please provide Token and File'); return; }
+
+                btn.disabled = true; btn.innerText = 'SYNCING...'; resultDiv.style.display = 'none';
                 const formData = new FormData();
                 formData.append('file', fileInput.files[0]);
 
                 try {
-                    const response = await fetch(`/import-patreon-csv?token=${token}`, {
-                        method: 'POST',
-                        body: formData
-                    });
-
+                    const response = await fetch('/import-patreon-csv?token=' + encodeURIComponent(token), { method: 'POST', body: formData });
                     const data = await response.json();
-                    btn.disabled = false;
-                    btn.innerText = 'SYNC MEMBERS';
-                    resultDiv.style.display = 'block';
+                    btn.disabled = false; btn.innerText = 'SYNC MEMBERS'; resultDiv.style.display = 'block';
 
                     if (response.ok) {
                         const res = data.result;
-                        let logHtml = `<div style="color:#4ADE80; font-weight:bold; margin-bottom:1rem;">✅ SYNC COMPLETED</div>`;
-                        logHtml += `<div class="stat-line"><span>New Subscribers</span><span class="stat-val">${res.new_subscribers}</span></div>`;
-                        logHtml += `<div class="stat-line"><span>Updated Members</span><span class="stat-val">${res.updated_members}</span></div>`;
-                        logHtml += `<div class="stat-line"><span>Unchanged</span><span class="stat-val">${res.skipped_members}</span></div>`;
-                        logHtml += `<div class="stat-line"><span>Blacklisted (Gone)</span><span class="stat-val">${res.new_blacklisted_members}</span></div>`;
-                        
-                        if (res.changed_details.length > 0) {
-                            logHtml += `<div class="tier-list"><b>⚠️ TIER CHANGES DETECTED:</b>`;
-                            res.changed_details.forEach(item => {
-                                logHtml += `<div class="tier-item"><b>${item.username}</b>: ${item.old_tier} ➔ ${item.new_tier}</div>`;
-                            });
-                            logHtml += `</div>`;
+                        let html = '<div style="color:#4ADE80;font-weight:bold;margin-bottom:1rem;">✅ SYNC COMPLETED</div>';
+                        html += statLine('New Subscribers', res.new_subscribers);
+                        html += statLine('Updated Members', res.updated_members);
+                        html += statLine('Unchanged', res.skipped_members);
+                        html += statLine('Blacklisted (Gone)', res.new_blacklisted_members);
+                        if (res.changed_details && res.changed_details.length > 0) {
+                            html += '<div class="tier-list"><b>⚠️ TIER CHANGES:</b>';
+                            res.changed_details.forEach(i => { html += '<div class="tier-item"><b>' + i.username + '</b>: ' + i.old_tier + ' ➔ ' + i.new_tier + '</div>'; });
+                            html += '</div>';
                         }
-                        resultDiv.innerHTML = logHtml;
+                        resultDiv.innerHTML = html;
                     } else {
-                        resultDiv.innerHTML = `<span style="color:#F87171">❌ Error: ${data.detail || 'Sync Failed'}</span>`;
+                        resultDiv.innerHTML = '<span style="color:#F87171">❌ Error: ' + (data.detail || 'Sync Failed') + '</span>';
                     }
-                } catch (error) {
-                    btn.disabled = false;
-                    btn.innerText = 'SYNC MEMBERS';
-                    resultDiv.style.display = 'block';
-                    resultDiv.innerHTML = `<span style="color:#F87171">❌ Connection Error: ${error.message}</span>`;
+                } catch (e) {
+                    btn.disabled = false; btn.innerText = 'SYNC MEMBERS'; resultDiv.style.display = 'block';
+                    resultDiv.innerHTML = '<span style="color:#F87171">❌ Connection Error: ' + e.message + '</span>';
                 }
+            }
+
+            async function handleGSheetUpload() {
+                const token = document.getElementById('gsheet-token').value;
+                const fileInput = document.getElementById('gsheet-file');
+                const resultDiv = document.getElementById('gsheet-result');
+                const btn = document.getElementById('gsheet-btn');
+
+                if (!token || !fileInput.files[0]) { alert('Please provide Token and File'); return; }
+
+                btn.disabled = true; btn.innerText = 'SYNCING...'; resultDiv.style.display = 'none';
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+
+                try {
+                    const response = await fetch('/import-gsheet-csv?token=' + encodeURIComponent(token), { method: 'POST', body: formData });
+                    const data = await response.json();
+                    btn.disabled = false; btn.innerText = 'SYNC DONATORS'; resultDiv.style.display = 'block';
+
+                    if (response.ok) {
+                        const res = data.result;
+                        let html = '<div style="color:#4ADE80;font-weight:bold;margin-bottom:1rem;">✅ SYNC COMPLETED</div>';
+                        html += statLine('New Donators', res.new_subscribers);
+                        html += statLine('Newly Blacklisted (expired)', res.newly_blacklisted);
+                        html += statLine('Reactivated (re-subscribed)', res.reactivated_members);
+                        html += statLine('Unchanged', res.skipped_members);
+                        resultDiv.innerHTML = html;
+                    } else {
+                        resultDiv.innerHTML = '<span style="color:#F87171">❌ Error: ' + (data.detail || 'Sync Failed') + '</span>';
+                    }
+                } catch (e) {
+                    btn.disabled = false; btn.innerText = 'SYNC DONATORS'; resultDiv.style.display = 'block';
+                    resultDiv.innerHTML = '<span style="color:#F87171">❌ Connection Error: ' + e.message + '</span>';
+                }
+            }
+
+            function statLine(label, val) {
+                return '<div class="stat-line"><span>' + label + '</span><span class="stat-val">' + val + '</span></div>';
             }
         </script>
     </body>
