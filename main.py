@@ -1,7 +1,9 @@
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Request
 from fastapi.responses import HTMLResponse
 import csv
 import io
+import hmac
+import hashlib
 from supabase import create_client
 from jose import jwt, JWTError
 from datetime import datetime, timedelta, timezone
@@ -21,6 +23,7 @@ JWT_EXPIRE_DAYS = 7
 PATREON_ACCESS_TOKEN = os.getenv("PATREON_ACCESS_TOKEN")
 PATREON_CAMPAIGN_ID = os.getenv("PATREON_CAMPAIGN_ID")
 SYNC_TOKEN = os.getenv("SYNC_TOKEN")
+PATREON_WEBHOOK_SECRET = os.getenv("PATREON_WEBHOOK_SECRET")
 
 DEV_EMAILS = ["lxpetitprixce@gmail.com", "devthelastyear@yuzuru.rin"]
 
@@ -603,6 +606,85 @@ def sync_patreon_members(token: str = Query(...)):
         raise HTTPException(status_code=500, detail=f"Patreon HTTP error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
+
+
+# =====================
+# Patreon Webhook (real-time, push-based)
+# =====================
+def verify_patreon_signature(raw_body: bytes, signature: str) -> bool:
+    if not PATREON_WEBHOOK_SECRET or not signature:
+        return False
+    # Patreon signs the raw request body with HMAC-MD5 using the webhook secret
+    expected = hmac.new(
+        PATREON_WEBHOOK_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.md5
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def extract_email_from_webhook(payload: dict):
+    # Get email even when the member has no active tier (used for delete events)
+    member = payload.get("data", {})
+    included_map = build_included_map(payload.get("included", []))
+    attrs = member.get("attributes", {})
+    email = attrs.get("email")
+    if not email:
+        user_rel = member.get("relationships", {}).get("user", {}).get("data")
+        if user_rel:
+            user_obj = included_map.get((user_rel["type"], user_rel["id"]))
+            if user_obj:
+                email = user_obj.get("attributes", {}).get("email")
+    return email.lower().strip() if email else None
+
+
+@app.post("/webhook/patreon")
+async def patreon_webhook(request: Request):
+    raw_body = await request.body()
+    signature = request.headers.get("X-Patreon-Signature", "")
+    event = request.headers.get("X-Patreon-Event", "")
+
+    # 1. Make sure the request really came from Patreon
+    if not verify_patreon_signature(raw_body, signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    payload = await request.json()
+    member_obj = payload.get("data", {})
+    included_map = build_included_map(payload.get("included", []))
+
+    # 2. Member left / pledge deleted -> blacklist by email (protect dev/donator)
+    if event in ("members:delete", "members:pledge:delete"):
+        email = extract_email_from_webhook(payload)
+        if email and email not in DEV_EMAILS:
+            existing = (
+                supabase.table("member_list")
+                .select("tier").eq("email", email).limit(1).execute()
+            )
+            tier = (existing.data[0].get("tier") or "") if existing.data else ""
+            if "Donator" not in tier:
+                supabase.table("member_list").update(
+                    {"blacklist": True, "updated_at": now_iso()}
+                ).eq("email", email).execute()
+        return {"status": "ok", "event": event, "action": "blacklisted"}
+
+    # 3. Create / update / pledge created -> upsert using the existing parser
+    row = parse_patreon_member(member_obj, included_map)
+    if not row:
+        # No paid tier (Free / removed) -> nothing to store
+        return {"status": "ok", "event": event, "action": "skipped"}
+
+    if row["email"] in DEV_EMAILS:
+        return {"status": "ok", "event": event, "action": "skipped_dev"}
+
+    upsert_member(row)
+    return {
+        "status": "ok",
+        "event": event,
+        "action": "upserted",
+        "email": row["email"],
+        "tier": row["tier"],
+        "blacklist": row["blacklist"],
+    }
 
 
 # =====================
