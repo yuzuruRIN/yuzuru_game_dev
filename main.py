@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Request
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse
 import csv
 import io
@@ -24,6 +24,10 @@ PATREON_ACCESS_TOKEN = os.getenv("PATREON_ACCESS_TOKEN")
 PATREON_CAMPAIGN_ID = os.getenv("PATREON_CAMPAIGN_ID")
 SYNC_TOKEN = os.getenv("SYNC_TOKEN")
 PATREON_WEBHOOK_SECRET = os.getenv("PATREON_WEBHOOK_SECRET")
+
+# Minimum gap between webhook-triggered full syncs (hours)
+AUTO_SYNC_MIN_INTERVAL_HOURS = 6
+last_auto_sync_at = None
 
 DEV_EMAILS = ["lxpetitprixce@gmail.com", "devthelastyear@yuzuru.rin"]
 
@@ -351,6 +355,29 @@ def run_patreon_sync():
     }
 
 
+def auto_sync_if_stale():
+    """Full sync piggybacked on webhook wake-ups.
+
+    Runs AFTER the webhook response is sent, so Patreon is not kept waiting.
+    Catches anything a single webhook event can't: members who left while
+    the server was asleep, expired charges, missed events, etc.
+    Throttled so bursts of webhook events don't trigger repeated full syncs.
+    """
+    global last_auto_sync_at
+    now = datetime.now(timezone.utc)
+    if last_auto_sync_at and (now - last_auto_sync_at) < timedelta(hours=AUTO_SYNC_MIN_INTERVAL_HOURS):
+        return
+    last_auto_sync_at = now
+    try:
+        result = run_patreon_sync()
+        print(
+            f"[Auto Sync] done: new={result.get('new_subscribers')} "
+            f"updated={result.get('updated_members')} "
+            f"blacklisted={result.get('new_blacklisted_members')}"
+        )
+    except Exception as e:
+        print(f"[Auto Sync] failed: {e}")
+
 
 # =====================
 # Root
@@ -639,7 +666,7 @@ def extract_email_from_webhook(payload: dict):
 
 
 @app.post("/webhook/patreon")
-async def patreon_webhook(request: Request):
+async def patreon_webhook(request: Request, background_tasks: BackgroundTasks):
     raw_body = await request.body()
     signature = request.headers.get("X-Patreon-Signature", "")
     event = request.headers.get("X-Patreon-Event", "")
@@ -647,6 +674,10 @@ async def patreon_webhook(request: Request):
     # 1. Make sure the request really came from Patreon
     if not verify_patreon_signature(raw_body, signature):
         raise HTTPException(status_code=403, detail="Invalid signature")
+
+    # While the server is awake anyway, sweep for expired/left members
+    # in the background (throttled, runs after the response is sent)
+    background_tasks.add_task(auto_sync_if_stale)
 
     payload = await request.json()
     member_obj = payload.get("data", {})
