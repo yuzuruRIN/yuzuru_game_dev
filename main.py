@@ -713,20 +713,14 @@ async def patreon_webhook(request: Request, background_tasks: BackgroundTasks):
     member_obj = payload.get("data", {})
     included_map = build_included_map(payload.get("included", []))
 
-    # 2. Member left / pledge deleted -> blacklist by email (protect dev/donator)
+    # 2. Member left / pledge deleted -> defer to the sync sweep.
+    #    Patreon keeps a cancelled member's benefits (and reports them as
+    #    active with their tier) until the paid period ends, so blacklisting
+    #    here is premature -- and the next full sync would revert it anyway.
+    #    The sweep blacklists them automatically once entitlement lapses.
     if event in ("members:delete", "members:pledge:delete"):
         email = extract_email_from_webhook(payload)
-        if email and email not in DEV_EMAILS:
-            existing = (
-                supabase.table("member_list")
-                .select("tier").eq("email", email).limit(1).execute()
-            )
-            tier = (existing.data[0].get("tier") or "") if existing.data else ""
-            if "Donator" not in tier:
-                supabase.table("member_list").update(
-                    {"blacklist": True, "updated_at": now_iso()}
-                ).eq("email", email).execute()
-        return {"status": "ok", "event": event, "action": "blacklisted"}
+        return {"status": "ok", "event": event, "action": "deferred_to_sync", "email": email}
 
     # 3. Create / update / pledge created -> upsert using the existing parser
     row = parse_patreon_member(member_obj, included_map)
