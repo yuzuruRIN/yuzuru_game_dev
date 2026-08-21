@@ -25,6 +25,10 @@ PATREON_CAMPAIGN_ID = os.getenv("PATREON_CAMPAIGN_ID")
 SYNC_TOKEN = os.getenv("SYNC_TOKEN")
 PATREON_WEBHOOK_SECRET = os.getenv("PATREON_WEBHOOK_SECRET")
 
+# Discord bot (Reina) webhook — forward Patreon events so the bot posts a confirm card
+# e.g. http://<oracle-ip>:8080/patreon/webhook  (leave unset to disable forwarding)
+BOT_WEBHOOK_URL = os.getenv("BOT_WEBHOOK_URL")
+
 # Minimum gap between webhook-triggered full syncs (hours)
 AUTO_SYNC_MIN_INTERVAL_HOURS = 6
 last_auto_sync_at = None
@@ -665,6 +669,29 @@ def extract_email_from_webhook(payload: dict):
     return email.lower().strip() if email else None
 
 
+def forward_to_bot(raw_body: bytes, signature: str, event: str):
+    """Forward the untouched Patreon request (same body + signature) to the
+    Discord bot, which verifies it with the shared secret and posts a
+    confirmation card. Runs after the response is sent; failure here never
+    affects the reply to Patreon."""
+    if not BOT_WEBHOOK_URL:
+        return
+    try:
+        r = requests.post(
+            BOT_WEBHOOK_URL,
+            data=raw_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Patreon-Signature": signature,
+                "X-Patreon-Event": event,
+            },
+            timeout=10,
+        )
+        print(f"[Bot Forward] {event} -> {r.status_code}")
+    except Exception as e:
+        print(f"[Bot Forward] failed: {e}")
+
+
 @app.post("/webhook/patreon")
 async def patreon_webhook(request: Request, background_tasks: BackgroundTasks):
     raw_body = await request.body()
@@ -674,6 +701,9 @@ async def patreon_webhook(request: Request, background_tasks: BackgroundTasks):
     # 1. Make sure the request really came from Patreon
     if not verify_patreon_signature(raw_body, signature):
         raise HTTPException(status_code=403, detail="Invalid signature")
+
+    # Forward a copy to the Discord bot so admins get a confirm card
+    background_tasks.add_task(forward_to_bot, raw_body, signature, event)
 
     # While the server is awake anyway, sweep for expired/left members
     # in the background (throttled, runs after the response is sent)
