@@ -96,14 +96,15 @@ def parse_patreon_member(member, included_map):
     if user_rel:
         user_obj = included_map.get((user_rel["type"], user_rel["id"]))
 
-    tier_titles = []
+    tier_infos = []  # (title, amount_cents)
     entitled_tiers = rels.get("currently_entitled_tiers", {}).get("data", [])
     for tier_ref in entitled_tiers:
         tier_obj = included_map.get((tier_ref["type"], tier_ref["id"]))
         if tier_obj:
-            title = tier_obj.get("attributes", {}).get("title")
+            t_attrs = tier_obj.get("attributes", {})
+            title = t_attrs.get("title")
             if title:
-                tier_titles.append(title)
+                tier_infos.append((title, t_attrs.get("amount_cents") or 0))
 
     # Try to get email and username from member attributes first
     email = attrs.get("email")
@@ -119,7 +120,7 @@ def parse_patreon_member(member, included_map):
         patreon_user_id = user_obj.get("id")
 
     # Filter out "Free" tiers and ensure common casing
-    active_tiers = [t for t in tier_titles if t.lower().strip() != "free"]
+    active_tiers = [(t, a) for t, a in tier_infos if t.lower().strip() != "free"]
 
     # If they only have "Free" or no tiers, skip them
     if not active_tiers:
@@ -134,14 +135,17 @@ def parse_patreon_member(member, included_map):
 
     active = is_member_active(
         patron_status=patron_status,
-        tier_titles=active_tiers,
+        tier_titles=[t for t, _ in active_tiers],
         last_charge_status=last_charge_status
     )
 
     return {
         "username": username,
         "email": email.lower().strip(),
-        "tier": active_tiers[-1],
+        # The API does not guarantee tier order, and an upgraded member is
+        # entitled to several tiers until the period rolls over -- pick the
+        # most expensive one, never just the last in the list
+        "tier": max(active_tiers, key=lambda t: t[1])[0],
         "blacklist": not active,
         "patreon_user_id": patreon_user_id,
         "patron_status": patron_status,
@@ -167,7 +171,7 @@ def fetch_patreon_members():
         "include": "user,currently_entitled_tiers",
         "fields[member]": "email,full_name,patron_status,last_charge_status,next_charge_date",
         "fields[user]": "email,full_name,vanity",
-        "fields[tier]": "title",
+        "fields[tier]": "title,amount_cents",
         "page[count]": 100
     }
 
