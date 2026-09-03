@@ -16,9 +16,18 @@ import os
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_NOW")
+JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 7
+
+# Never boot with a guessable secret: anyone who knows it can forge a token for
+# any account. The old default ("CHANGE_ME_NOW") let the server start silently
+# insecure whenever the env var was missing.
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET environment variable is required")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY are required")
 
 PATREON_ACCESS_TOKEN = os.getenv("PATREON_ACCESS_TOKEN")
 PATREON_CAMPAIGN_ID = os.getenv("PATREON_CAMPAIGN_ID")
@@ -43,10 +52,12 @@ app = FastAPI()
 # JWT Utils
 # =====================
 def create_token(email: str):
+    # datetime.utcnow() is deprecated from Python 3.12 on
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": email,
-        "exp": datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS),
-        "iat": datetime.utcnow()
+        "exp": now + timedelta(days=JWT_EXPIRE_DAYS),
+        "iat": now
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
@@ -57,6 +68,220 @@ def verify_token(token: str):
         return payload.get("sub")
     except JWTError:
         return None
+
+
+# =====================
+# Shared helpers
+# =====================
+#  amount_limit convention, used consistently everywhere below:
+#     amount_limit <= 0 or NULL  = unlimited uses
+#     amount_limit  > 0          = at most that many uses per account
+# ---------------------
+
+def _as_int(value, default=0):
+    """Always return an int - a NULL column would otherwise blow up on `None > 0`."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_text(value, default=""):
+    """
+    Guard against NULL columns.
+    dict.get(key, default) does not help here: when the key exists but holds None
+    it returns None, not the default - that is how "Welcome back, None" reached players.
+    """
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _is_dev(email):
+    """Case-insensitive DEV_EMAILS check - the stored address may be mixed case."""
+    return _as_text(email).lower() in DEV_EMAILS
+
+
+def _tier_list(raw):
+    """
+    allowed_tiers may be a jsonb array or plain text.
+    Using `tier not in raw` directly on text degrades into a substring test
+    (tier "old" would satisfy allowed_tiers "Gold"), so normalise to a list first.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items = raw.replace("[", "").replace("]", "").replace('"', "").split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        return []
+    return [t for t in (_as_text(i).lower() for i in items) if t]
+
+
+def _log(where, exc):
+    import traceback
+    print(f"[ERROR] {where}: {exc}")
+    traceback.print_exc()
+
+
+def _get_member(email):
+    """
+    Look a member up by email, ignoring case.
+
+    /login used to lowercase the input and then match with .eq(), so any member
+    whose stored address has capitals (the dev account among them) could not log
+    in at all. Falls back to ilike, then re-checks in Python because "_" and "%"
+    are LIKE wildcards and appear in real addresses - the extra check keeps a
+    pattern from matching the wrong person.
+    """
+    raw = _as_text(email)
+    if not raw:
+        return None
+
+    res = (
+        supabase
+        .table("member_list")
+        .select("*")
+        .eq("email", raw)
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        return res.data[0]
+
+    res = (
+        supabase
+        .table("member_list")
+        .select("*")
+        .ilike("email", raw)
+        .limit(20)
+        .execute()
+    )
+    target = raw.lower()
+    for row in (res.data or []):
+        if _as_text(row.get("email")).lower() == target:
+            return row
+
+    return None
+
+
+def _get_cheat(code):
+    """Look a cheat code up ignoring case - codes are CamelCase and players mistype it."""
+    raw = _as_text(code)
+    if not raw:
+        return None
+
+    res = (
+        supabase
+        .table("cheatcode_check_list")
+        .select("*")
+        .eq("code", raw)
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        return res.data[0]
+
+    res = (
+        supabase
+        .table("cheatcode_check_list")
+        .select("*")
+        .ilike("code", raw)
+        .limit(20)
+        .execute()
+    )
+    target = raw.lower()
+    for row in (res.data or []):
+        if _as_text(row.get("code")).lower() == target:
+            return row
+
+    return None
+
+
+def _consume_usage(email, cheat_id, amount_limit):
+    """
+    Increment used_count once, using compare-and-swap.
+
+    The previous read-then-write was not atomic: concurrent requests all read the
+    same used_count and overwrote each other, letting a code exceed amount_limit.
+    The .eq("used_count", ...) guard makes a losing writer update no rows, so it
+    re-reads and tries again.
+
+    Returns (ok: bool, reason: str|None)
+    """
+    for _ in range(3):
+        usage_res = (
+            supabase
+            .table("cheatcode_usage")
+            .select("used_count")
+            .eq("member_email", email)
+            .eq("cheat_id", cheat_id)
+            .limit(1)
+            .execute()
+        )
+
+        if usage_res.data:
+            raw_used = usage_res.data[0].get("used_count")
+            used_count = _as_int(raw_used)
+
+            if amount_limit > 0 and used_count >= amount_limit:
+                return False, "limit_reached"
+
+            guard = (
+                supabase
+                .table("cheatcode_usage")
+                .update({"used_count": used_count + 1})
+                .eq("member_email", email)
+                .eq("cheat_id", cheat_id)
+            )
+
+            # The CAS guard must compare against the raw stored value, not the
+            # normalised one: .eq("used_count", 0) matches no row when it is NULL.
+            if raw_used is None:
+                guard = guard.is_("used_count", None)
+            else:
+                guard = guard.eq("used_count", raw_used)
+
+            upd = guard.execute()
+
+            if getattr(upd, "data", None):
+                return True, None
+
+            # Some supabase-py versions do not return the updated rows - confirm by re-reading.
+            recheck = (
+                supabase
+                .table("cheatcode_usage")
+                .select("used_count")
+                .eq("member_email", email)
+                .eq("cheat_id", cheat_id)
+                .limit(1)
+                .execute()
+            )
+            if recheck.data and _as_int(recheck.data[0].get("used_count")) == used_count + 1:
+                return True, None
+
+            # Lost the race - re-read and retry.
+            continue
+
+        # First use of this code: create the row.
+        # The old code returned "limit_reached" here whenever amount_limit <= 0,
+        # which made unlimited codes unusable for anyone who had not used them yet.
+        try:
+            supabase.table("cheatcode_usage").insert({
+                "member_email": email,
+                "cheat_id": cheat_id,
+                "used_count": 1
+            }).execute()
+            return True, None
+        except Exception:
+            # Another request created the row at the same time - re-read and retry.
+            continue
+
+    return False, "server_error"
 
 
 def now_iso():
@@ -230,7 +455,7 @@ def mark_missing_members_blacklisted(active_emails, db_map):
         tier = row.get("tier") or ""
         
         # Skip dev/donator
-        if email in DEV_EMAILS or "Donator" in tier:
+        if _is_dev(email) or "Donator" in tier:
             continue
 
         # Collect emails of those who should be blacklisted
@@ -291,7 +516,7 @@ def run_patreon_sync():
         email = member["email"]
         active_emails.add(email)
 
-        if email in DEV_EMAILS:
+        if _is_dev(email):
             continue
 
         # Comparison Logic
@@ -391,8 +616,10 @@ def auto_sync_if_stale():
 # Root
 # =====================
 @app.get("/")
+@app.get("/health")
 def root():
-    return {"status": "ok"}
+    # The game pings this to wake the Render free-tier instance before a login.
+    return {"status": "ok", "result": "ok"}
 
 
 # =====================
@@ -400,38 +627,37 @@ def root():
 # =====================
 @app.post("/login")
 def login(data: dict):
-    email = data.get("email")
+    try:
+        email = _as_text(data.get("email"))
 
-    if not email:
-        return {"result": "fail"}
+        if not email:
+            return {"result": "fail"}
 
-    email = email.lower().strip()
+        member = _get_member(email)
 
-    res = (
-        supabase
-        .table("member_list")
-        .select("*")
-        .eq("email", email)
-        .limit(1)
-        .execute()
-    )
+        if not member:
+            return {"result": "fail"}
 
-    if not res.data:
-        return {"result": "fail"}
+        if member.get("blacklist") is True:
+            return {"result": "banned"}
 
-    member = res.data[0]
+        # Use the address exactly as stored, not as typed, so every endpoint and
+        # every cheatcode_usage row keys off the same string. Lowercasing here
+        # instead would orphan the usage history of mixed-case addresses.
+        canonical_email = _as_text(member.get("email"), email)
 
-    if member.get("blacklist") is True:
-        return {"result": "banned"}
+        token = create_token(canonical_email)
 
-    token = create_token(email)
+        return {
+            "result": "ok",
+            "token": token,
+            "username": _as_text(member.get("username"), "Supporter"),
+            "tier": _as_text(member.get("tier"), "Free")
+        }
 
-    return {
-        "result": "ok",
-        "token": token,
-        "username": member.get("username", "Supporter"),
-        "tier": member.get("tier", "Free")
-    }
+    except Exception as exc:
+        _log("login", exc)
+        return {"result": "server_error"}
 
 
 # =====================
@@ -439,19 +665,37 @@ def login(data: dict):
 # =====================
 @app.post("/verify-token")
 def verify(data: dict):
-    token = data.get("token")
+    try:
+        token = data.get("token")
 
-    if not token:
-        return {"result": "invalid"}
+        if not token:
+            return {"result": "invalid"}
 
-    email = verify_token(token)
-    if not email:
-        return {"result": "invalid"}
+        email = verify_token(token)
+        if not email:
+            return {"result": "invalid"}
 
-    return {
-        "result": "ok",
-        "email": email
-    }
+        # This used to only decode the JWT, so an account that had been removed
+        # or lost its entitlement still looked logged in until the token expired
+        # (up to 7 days). Returning username/tier also lets the game refresh them
+        # without making the player log out and back in.
+        member = _get_member(email)
+        if not member:
+            return {"result": "invalid"}
+
+        if member.get("blacklist") is True:
+            return {"result": "banned"}
+
+        return {
+            "result": "ok",
+            "email": email,
+            "username": _as_text(member.get("username"), "Supporter"),
+            "tier": _as_text(member.get("tier"), "Free")
+        }
+
+    except Exception as exc:
+        _log("verify-token", exc)
+        return {"result": "server_error"}
 
 
 # =====================
@@ -459,71 +703,73 @@ def verify(data: dict):
 # =====================
 @app.post("/get-history")
 def get_history(data: dict):
-    token = data.get("token")
+    try:
+        token = data.get("token")
 
-    if not token:
-        return {"result": "unauthorized"}
+        if not token:
+            return {"result": "unauthorized"}
 
-    email = verify_token(token)
-    if not email:
-        return {"result": "unauthorized"}
+        email = verify_token(token)
+        if not email:
+            return {"result": "unauthorized"}
 
-    member_res = (
-        supabase
-        .table("member_list")
-        .select("blacklist, username, tier")
-        .eq("email", email)
-        .limit(1)
-        .execute()
-    )
+        member = _get_member(email)
+        if not member:
+            return {"result": "unauthorized"}
 
-    if not member_res.data:
-        return {"result": "unauthorized"}
+        if member.get("blacklist") is True:
+            return {"result": "banned"}
 
-    member = member_res.data[0]
+        usage_res = (
+            supabase
+            .table("cheatcode_usage")
+            .select("cheat_id, used_count")
+            .eq("member_email", email)
+            .execute()
+        )
 
-    if member.get("blacklist") is True:
-        return {"result": "banned"}
+        history = []
+        usage_rows = usage_res.data or []
 
-    usage_res = (
-        supabase
-        .table("cheatcode_usage")
-        .select("cheat_id, used_count")
-        .eq("member_email", email)
-        .execute()
-    )
+        if usage_rows:
+            # This used to run one query per usage row (N+1), which is slow on the
+            # Render free tier. Fetch every code's details in a single .in_() call.
+            cheat_ids = [u.get("cheat_id") for u in usage_rows if u.get("cheat_id") is not None]
 
-    history = []
-    if usage_res.data:
-        for usage in usage_res.data:
-            cheat_id = usage.get("cheat_id")
-            used_count = usage.get("used_count", 0)
+            cheat_map = {}
+            if cheat_ids:
+                cheat_res = (
+                    supabase
+                    .table("cheatcode_check_list")
+                    .select("id, code, effect, amount_limit")
+                    .in_("id", cheat_ids)
+                    .execute()
+                )
+                for cheat in (cheat_res.data or []):
+                    cheat_map[cheat.get("id")] = cheat
 
-            cheat_res = (
-                supabase
-                .table("cheatcode_check_list")
-                .select("code, effect, amount_limit")
-                .eq("id", cheat_id)
-                .limit(1)
-                .execute()
-            )
-
-            if cheat_res.data:
-                cheat = cheat_res.data[0]
+            for usage in usage_rows:
+                cheat = cheat_map.get(usage.get("cheat_id"))
+                if not cheat:
+                    continue
                 history.append({
                     "code": cheat.get("code"),
                     "effect": cheat.get("effect"),
-                    "used_count": used_count,
-                    "amount_limit": cheat.get("amount_limit", 0)
+                    "used_count": _as_int(usage.get("used_count")),
+                    "amount_limit": _as_int(cheat.get("amount_limit"))
                 })
 
-    return {
-        "result": "ok",
-        "email": email,
-        "username": member.get("username", "Supporter"),
-        "tier": member.get("tier", "Free"),
-        "history": history
-    }
+        return {
+            "result": "ok",
+            "email": email,
+            "username": _as_text(member.get("username"), "Supporter"),
+            "tier": _as_text(member.get("tier"), "Free"),
+            "history": history
+        }
+
+    except Exception as exc:
+        _log("get-history", exc)
+        return {"result": "server_error"}
 
 
 # =====================
@@ -531,96 +777,60 @@ def get_history(data: dict):
 # =====================
 @app.post("/use-cheat")
 def use_cheat(data: dict):
-    token = data.get("token")
-    cheat_code = data.get("cheat_code")
+    try:
+        token = data.get("token")
+        cheat_code = _as_text(data.get("cheat_code"))
 
-    if not token or not cheat_code:
-        return {"result": "fail"}
+        if not token or not cheat_code:
+            return {"result": "fail"}
 
-    email = verify_token(token)
-    if not email:
-        return {"result": "unauthorized"}
+        # 1. Verify token
+        email = verify_token(token)
+        if not email:
+            return {"result": "unauthorized"}
 
-    member_res = (
-        supabase
-        .table("member_list")
-        .select("blacklist, tier")
-        .eq("email", email)
-        .limit(1)
-        .execute()
-    )
+        # 2. Check member, blacklist, tier
+        member = _get_member(email)
+        if not member:
+            return {"result": "unauthorized"}
 
-    if not member_res.data:
-        return {"result": "unauthorized"}
+        if member.get("blacklist") is True:
+            return {"result": "banned"}
 
-    member = member_res.data[0]
+        member_tier = _as_text(member.get("tier"), "Free").lower()
 
-    if member.get("blacklist") is True:
-        return {"result": "banned"}
+        # 3. Check cheat code exists & active
+        cheat = _get_cheat(cheat_code)
+        if not cheat:
+            return {"result": "invalid_code"}
 
-    member_tier = member.get("tier")
+        cheat_id = cheat.get("id")
 
-    cheat_res = (
-        supabase
-        .table("cheatcode_check_list")
-        .select("*")
-        .eq("code", cheat_code)
-        .limit(1)
-        .execute()
-    )
+        if cheat.get("is_active") is not True:
+            return {"result": "code_disabled"}
 
-    if not cheat_res.data:
-        return {"result": "invalid_code"}
+        # 4. Check tier permission
+        allowed_tiers = _tier_list(cheat.get("allowed_tiers"))
 
-    cheat = cheat_res.data[0]
-    cheat_id = cheat.get("id")
+        if allowed_tiers and member_tier not in allowed_tiers:
+            return {"result": "tier_not_allowed"}
 
-    if cheat.get("is_active") is not True:
-        return {"result": "code_disabled"}
+        # 5. Check & consume usage
+        amount_limit = _as_int(cheat.get("amount_limit"))
 
-    allowed_tiers = cheat.get("allowed_tiers", [])
+        ok, reason = _consume_usage(email, cheat_id, amount_limit)
+        if not ok:
+            return {"result": reason}
 
-    if allowed_tiers and member_tier not in allowed_tiers:
-        return {"result": "tier_not_allowed"}
+        return {
+            "result": "ok",
+            "effect": cheat.get("effect"),
+            "payload": cheat.get("payload")
+        }
 
-    amount_limit = cheat.get("amount_limit", 0)
-
-    usage_res = (
-        supabase
-        .table("cheatcode_usage")
-        .select("*")
-        .eq("member_email", email)
-        .eq("cheat_id", cheat_id)
-        .limit(1)
-        .execute()
-    )
-
-    if usage_res.data:
-        usage = usage_res.data[0]
-        used_count = usage.get("used_count", 0)
-
-        if amount_limit > 0 and used_count >= amount_limit:
-            return {"result": "limit_reached"}
-
-        supabase.table("cheatcode_usage").update({
-            "used_count": used_count + 1
-        }).eq("member_email", email).eq("cheat_id", cheat_id).execute()
-
-    else:
-        if amount_limit > 0:
-            supabase.table("cheatcode_usage").insert({
-                "member_email": email,
-                "cheat_id": cheat_id,
-                "used_count": 1
-            }).execute()
-        else:
-            return {"result": "limit_reached"}
-
-    return {
-        "result": "ok",
-        "effect": cheat.get("effect"),
-        "payload": cheat.get("payload")
-    }
+    except Exception as exc:
+        _log("use-cheat", exc)
+        return {"result": "server_error"}
 
 
 # =====================
@@ -732,7 +942,7 @@ async def patreon_webhook(request: Request, background_tasks: BackgroundTasks):
         # No paid tier (Free / removed) -> nothing to store
         return {"status": "ok", "event": event, "action": "skipped"}
 
-    if row["email"] in DEV_EMAILS:
+    if _is_dev(row["email"]):
         return {"status": "ok", "event": event, "action": "skipped_dev"}
 
     upsert_member(row)
@@ -806,7 +1016,7 @@ def process_patreon_csv(csv_content: str):
             "updated_at": now_iso()
         }
 
-        if email in DEV_EMAILS:
+        if _is_dev(email):
             continue
 
         # Comparison Logic
