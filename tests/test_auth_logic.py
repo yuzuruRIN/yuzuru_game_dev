@@ -112,6 +112,17 @@ check("device_id ติดไปใน token", good["did"], 42)
 check("เครื่องอื่น -> ถูกปฏิเสธ", ns["_decode_game_token"](tok, "HWID-BBB"), None)
 check("ไม่ส่ง hwid -> ถูกปฏิเสธ", ns["_decode_game_token"](tok, ""), None)
 
+# payload ของ JWT ถอดอ่านได้ด้วย base64 เปล่า ๆ ไม่ต้องมี secret
+# -> ถ้า hwid ดิบโผล่ในนั้น คนที่ได้ไฟล์ persistent ของคนอื่นไปจะรู้ทันทีว่า
+#    ต้องปลอมตัวเป็นรหัสอะไร
+import base64  # noqa: E402
+_p = tok.split(".")[1]
+_raw = base64.urlsafe_b64decode(_p + "=" * (-len(_p) % 4)).decode()
+check("token ไม่มี hwid ดิบอยู่ข้างใน", "HWID-AAA" not in _raw, True)
+check("เก็บเป็น fingerprint ยาว 64 ตัว", len(ns["_hwid_fingerprint"]("HWID-AAA")), 64)
+check("fingerprint คนละเครื่อง -> คนละค่า",
+      ns["_hwid_fingerprint"]("HWID-AAA") != ns["_hwid_fingerprint"]("HWID-BBB"), True)
+
 cheat_tok = jwt.encode(
     {"sub": "player@mail.com", "exp": datetime.now(timezone.utc) + timedelta(days=7)},
     "test-secret-abc123", algorithm="HS256")

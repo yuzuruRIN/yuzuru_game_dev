@@ -1594,11 +1594,28 @@ def _auth_log(email, event, hwid_hash=None, detail=None):
         print(f"[auth_log] {event} ({email}): {exc}")
 
 
+def _hwid_fingerprint(hwid_hash):
+    """
+    ค่าที่ฝังใน JWT แทนรหัสเครื่องดิบ
+
+    payload ของ JWT เป็นแค่ base64 ที่ใครก็ถอดอ่านได้ (ส่วนที่เข้ารหัสคือลายเซ็น
+    เท่านั้น) ถ้าเก็บ hwid ตรง ๆ คนที่ได้ไฟล์ persistent ของผู้เล่นคนอื่นไปจะเปิด
+    token อ่านได้ทันทีว่าต้องปลอมตัวเป็นรหัสอะไร แล้วแก้เกมให้ส่งค่านั้นก็สวม
+    สิทธิ์ได้เลย
+
+    เก็บเป็น HMAC แทน -> token ที่หลุดออกไปไม่บอกใบ้ว่าต้องปลอมเป็นอะไร และ
+    ย้อนกลับไม่ได้เพราะไม่มี JWT_SECRET
+    """
+    return hmac.new(
+        JWT_SECRET.encode(), _as_text(hwid_hash).encode(), hashlib.sha256
+    ).hexdigest()
+
+
 def _create_game_token(email, hwid_hash, device_id):
     now = datetime.now(timezone.utc)
     payload = {
         "sub": _norm_email(email),
-        "hwid": hwid_hash,
+        "hwid": _hwid_fingerprint(hwid_hash),
         "did": device_id,
         # แยกจาก token ของระบบโกงเดิม (create_token) ที่ไม่ได้ผูกเครื่อง
         "typ": "game",
@@ -1616,7 +1633,12 @@ def _decode_game_token(token, hwid_hash):
         return None
     if payload.get("typ") != "game":
         return None
-    if _as_text(payload.get("hwid")) != _as_text(hwid_hash):
+    # กันเคสส่ง hwid ว่างมา: fingerprint ของค่าว่างก็ยังเป็นสตริงที่เทียบได้
+    if not _as_text(hwid_hash):
+        return None
+    if not hmac.compare_digest(
+        _as_text(payload.get("hwid")), _hwid_fingerprint(hwid_hash)
+    ):
         return None
     return payload
 
