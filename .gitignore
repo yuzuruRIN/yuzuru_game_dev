@@ -1,3 +1,17 @@
 __pycache__/
 *.pyc
+
+# ความลับ — ห้าม commit เด็ดขาด
 .env
+.env.*
+!.env.example
+*credentials*.json
+
+# ไฟล์สำรองตอนแก้โค้ด
+*.bak
+*.orig
+*~
+
+# virtualenv
+.venv/
+venv/
