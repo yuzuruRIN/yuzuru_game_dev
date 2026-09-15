@@ -1513,8 +1513,21 @@ import secrets
 OTP_LENGTH = 6
 OTP_TTL_MINUTES = 10
 OTP_MAX_ATTEMPTS = 5
-OTP_RATE_LIMIT = 3               # ขอ OTP ได้กี่ครั้งต่อหน้าต่างเวลา
+
+# ── เพดานการขอ OTP ────────────────────────────────────────────────────────
+# นับเฉพาะคำขอที่ "ส่งเมลออกไปจริง" — คำขอที่โดนปฏิเสธไม่สร้างแถว จึงไม่ต่อ
+# เวลาการแบนของตัวเอง และไม่กินโควตาอีเมล
+#
+# ต่ออีเมล  = ปกป้องกล่องจดหมายของเจ้าของอีเมลจากการถูกยิงรัว
+# ต่อ IP    = ปกป้องโควตาอีเมลรวม และกันการไล่ยิงหลายอีเมลจากเครื่องเดียว
+#
+# ไม่มีเพดานต่อ hwid_hash เพราะค่านั้นฝั่งเกมส่งมาเอง คนยิงสคริปต์สุ่มค่าใหม่
+# ทุกครั้งได้ ด่านนั้นจึงกันได้แค่เกมที่วนลูปผิดพลาด ไม่ใช่คนที่ตั้งใจ
 OTP_RATE_WINDOW_MINUTES = 15
+OTP_RATE_LIMIT = 5               # ต่ออีเมล ต่อ 15 นาที
+OTP_DAILY_LIMIT_EMAIL = 10       # ต่ออีเมล ต่อ 24 ชม.
+OTP_RATE_LIMIT_IP = 10           # ต่อ IP ต่อ 15 นาที
+OTP_DAILY_LIMIT_IP = 30          # ต่อ IP ต่อ 24 ชม.
 
 DEVICE_SLOTS_DEFAULT = 2
 DEVICE_RELEASE_COOLDOWN_DAYS = 30
@@ -1558,6 +1571,52 @@ def _parse_iso(value):
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _client_ip(request):
+    """
+    IP จริงของผู้ขอ
+
+    แอปอยู่หลัง proxy ของ Render ดังนั้น request.client.host จะเป็น IP ของ proxy
+    เสมอ ต้องอ่านจาก X-Forwarded-For
+
+    ⚠️ ต้องเอา "ตัวสุดท้าย" ไม่ใช่ตัวแรก:
+        proxy แต่ละชั้นจะ *ต่อท้าย* IP ที่ตัวเองรับมา ถ้าผู้ยิงแนบ header
+        X-Forwarded-For ปลอมมาเอง ค่าปลอมนั้นจะไปอยู่ "ข้างหน้า" และ IP จริงที่
+        Render เติมจะอยู่ท้ายสุด — ถ้าอ่านตัวแรกจะโดนหลอกได้ทุกครั้งด้วยการ
+        สุ่ม header ใหม่ เท่ากับด่าน IP ไร้ผลไปเลย
+    """
+    fwd = _as_text(request.headers.get("x-forwarded-for"))
+    if fwd:
+        parts = [p.strip() for p in fwd.split(",") if p.strip()]
+        if parts:
+            return parts[-1][:64]
+    return _as_text(getattr(request.client, "host", ""))[:64]
+
+
+def _count_since(rows, cutoff):
+    """นับแถวที่ created_at ใหม่กว่า cutoff (แถวมาจากช่วง 24 ชม. อยู่แล้ว)"""
+    total = 0
+    for row in rows:
+        stamp = _parse_iso(row.get("created_at"))
+        if stamp and stamp >= cutoff:
+            total += 1
+    return total
+
+
+def _otp_rows_since(column, value, cutoff):
+    if not value:
+        return []
+    res = (
+        supabase
+        .table("otp_codes")
+        .select("created_at")
+        .eq(column, value)
+        .gte("created_at", cutoff.isoformat())
+        .limit(500)
+        .execute()
+    )
+    return res.data or []
 
 
 def _gen_otp():
@@ -1739,10 +1798,11 @@ def _member_or_error(email):
 # Auth: Request OTP
 # =====================
 @app.post("/auth/request-otp")
-def auth_request_otp(data: dict):
+def auth_request_otp(data: dict, request: Request):
     try:
         email = _norm_email(data.get("email"))
         hwid = _as_text(data.get("hwid_hash"))
+        ip = _client_ip(request)
 
         if not email or not hwid:
             return {"result": "fail"}
@@ -1753,28 +1813,41 @@ def auth_request_otp(data: dict):
 
         canon = _norm_email(member.get("email")) or email
 
-        # กันคนสแปมกล่องจดหมายของสมาชิกคนอื่น
-        since = datetime.now(timezone.utc) - timedelta(minutes=OTP_RATE_WINDOW_MINUTES)
-        recent = (
-            supabase
-            .table("otp_codes")
-            .select("id")
-            .eq("email", canon)
-            .gte("created_at", since.isoformat())
-            .execute()
-        )
-        if len(recent.data or []) >= OTP_RATE_LIMIT:
-            _auth_log(canon, "otp_rate_limited", hwid)
-            return {"result": "rate_limited", "retry_after_minutes": OTP_RATE_WINDOW_MINUTES}
+        # ── เพดานการขอรหัส ────────────────────────────────────────────────
+        # ดึงมาทีเดียวช่วง 24 ชม. แล้วนับช่วง 15 นาทีเอาใน Python
+        # -> 2 query แทนที่จะเป็น 4
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(minutes=OTP_RATE_WINDOW_MINUTES)
+        day_start = now - timedelta(hours=24)
+
+        def _deny(scope, retry_minutes):
+            _auth_log(canon, "otp_rate_limited", hwid, {"scope": scope, "ip": ip})
+            return {"result": "rate_limited", "retry_after_minutes": retry_minutes}
+
+        email_rows = _otp_rows_since("email", canon, day_start)
+        if len(email_rows) >= OTP_DAILY_LIMIT_EMAIL:
+            return _deny("email_day", 60 * 24)
+        if _count_since(email_rows, window_start) >= OTP_RATE_LIMIT:
+            return _deny("email_window", OTP_RATE_WINDOW_MINUTES)
+
+        # IP เป็นด่านเดียวที่ผู้ยิงปลอมไม่ได้ (hwid ฝั่งเกมส่งมาเอง)
+        # ถ้าอ่าน IP ไม่ได้ ก็ปล่อยผ่านด่านนี้ ดีกว่าบล็อกผู้เล่นจริงทิ้ง
+        if ip:
+            ip_rows = _otp_rows_since("request_ip", ip, day_start)
+            if len(ip_rows) >= OTP_DAILY_LIMIT_IP:
+                return _deny("ip_day", 60 * 24)
+            if _count_since(ip_rows, window_start) >= OTP_RATE_LIMIT_IP:
+                return _deny("ip_window", OTP_RATE_WINDOW_MINUTES)
 
         code = _gen_otp()
-        expires = datetime.now(timezone.utc) + timedelta(minutes=OTP_TTL_MINUTES)
+        expires = now + timedelta(minutes=OTP_TTL_MINUTES)
 
         supabase.table("otp_codes").insert({
             "email": canon,
             "code_hash": _hash_otp(canon, code),
             "purpose": "activate",
             "hwid_hash": hwid,
+            "request_ip": ip or None,
             "expires_at": expires.isoformat(),
         }).execute()
 
