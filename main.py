@@ -1529,6 +1529,22 @@ OTP_DAILY_LIMIT_EMAIL = 10       # ต่ออีเมล ต่อ 24 ชม.
 OTP_RATE_LIMIT_IP = 10           # ต่อ IP ต่อ 15 นาที
 OTP_DAILY_LIMIT_IP = 30          # ต่อ IP ต่อ 24 ชม.
 
+# ── โหมดยืนยันตัวตน ───────────────────────────────────────────────────────
+# ตั้ง OTP_REQUIRED=1 เพื่อบังคับยืนยันด้วยรหัสทางอีเมล (ต้องตั้ง Resend ให้
+# เรียบร้อยก่อน ไม่งั้นจะไม่มีใครล็อกอินได้เลย)
+#
+# ค่าเริ่มต้นคือ "ปิด" = ใช้อีเมลอย่างเดียว ตามที่ตัดสินใจกันไว้:
+# อีเมลเป็นข้อมูลของผู้สนับสนุนเอง ถ้าเจ้าตัวเต็มใจแบ่งให้คนอื่นก็เป็นสิทธิ์ของเขา
+# ด่านที่เหลือจึงเป็นการจำกัดจำนวนเครื่อง + ให้เจ้าตัวเห็นและปลดเครื่องเองได้
+#
+# สลับค่านี้ได้ทุกเมื่อโดยไม่ต้องให้ผู้เล่นอัปเดตเกม — เกมถามเซิร์ฟเวอร์ทุกครั้ง
+OTP_REQUIRED = os.getenv("OTP_REQUIRED") == "1"
+
+# เมื่อไม่มี OTP อีเมลคือหลักฐานชิ้นเดียว จึงต้องกันคนไล่ยิงอีเมลมั่ว ๆ
+# นับต่อ IP เพราะ hwid_hash ฝั่งเกมส่งมาเอง ปลอมได้ไม่จำกัด
+ACTIVATE_RATE_LIMIT_IP = 10      # พยายามผูกเครื่อง ต่อ IP ต่อ 15 นาที
+ACTIVATE_DAILY_LIMIT_IP = 40     # พยายามผูกเครื่อง ต่อ IP ต่อ 24 ชม.
+
 DEVICE_SLOTS_DEFAULT = 2
 DEVICE_RELEASE_COOLDOWN_DAYS = 30
 GAME_TOKEN_EXPIRE_DAYS = 30
@@ -1619,6 +1635,28 @@ def _otp_rows_since(column, value, cutoff):
     return res.data or []
 
 
+def _activate_rows_since(ip, cutoff):
+    """
+    ครั้งที่พยายามผูกเครื่องจาก IP นี้ นับทั้งที่สำเร็จและถูกปฏิเสธ
+
+    ต้องนับที่ล้มเหลวด้วย ไม่งั้นคนไล่เดาอีเมลจะยิงได้ไม่จำกัด เพราะการเดาผิด
+    ไม่เคยสร้างแถวใน devices
+    """
+    if not ip:
+        return []
+    res = (
+        supabase
+        .table("auth_log")
+        .select("created_at")
+        .eq("request_ip", ip)
+        .in_("event", ["activated", "activate_denied"])
+        .gte("created_at", cutoff.isoformat())
+        .limit(500)
+        .execute()
+    )
+    return res.data or []
+
+
 def _gen_otp():
     """secrets ไม่ใช่ random — เลข OTP ต้องเดาไม่ได้"""
     return f"{secrets.randbelow(10 ** OTP_LENGTH):0{OTP_LENGTH}d}"
@@ -1636,7 +1674,7 @@ def _hash_otp(email, code):
     return hmac.new(JWT_SECRET.encode(), msg, hashlib.sha256).hexdigest()
 
 
-def _auth_log(email, event, hwid_hash=None, detail=None):
+def _auth_log(email, event, hwid_hash=None, detail=None, ip=None):
     """
     บันทึกทุกเหตุการณ์สำคัญ — ตัวนี้จะช่วยมากตอนผู้เล่นทักมาว่า "เข้าไม่ได้"
 
@@ -1648,6 +1686,7 @@ def _auth_log(email, event, hwid_hash=None, detail=None):
             "event": event,
             "hwid_hash": hwid_hash or None,
             "detail": detail,
+            "request_ip": ip or None,
         }).execute()
     except Exception as exc:
         print(f"[auth_log] {event} ({email}): {exc}")
@@ -1813,6 +1852,13 @@ def auth_request_otp(data: dict, request: Request):
 
         canon = _norm_email(member.get("email")) or email
 
+        # โหมดอีเมลอย่างเดียว — บอกเกมให้ข้ามไปผูกเครื่องได้เลย
+        #
+        # ยังตรวจสมาชิกให้ครบก่อนถึงจะตอบ เพราะเกมต้องแยกให้ออกว่าเป็น
+        # not_member / banned / use_linkemail ไม่ใช่ปล่อยผ่านทุกอีเมล
+        if not OTP_REQUIRED:
+            return {"result": "not_required", "email": canon}
+
         # ── เพดานการขอรหัส ────────────────────────────────────────────────
         # ดึงมาทีเดียวช่วง 24 ชม. แล้วนับช่วง 15 นาทีเอาใน Python
         # -> 2 query แทนที่จะเป็น 4
@@ -1867,60 +1913,81 @@ def auth_request_otp(data: dict, request: Request):
 # Auth: Activate device
 # =====================
 @app.post("/auth/activate")
-def auth_activate(data: dict):
+def auth_activate(data: dict, request: Request):
     try:
         email = _norm_email(data.get("email"))
         code = _as_text(data.get("otp"))
         hwid = _as_text(data.get("hwid_hash"))
         platform = _as_text(data.get("platform"), "unknown")[:32]
         label = _as_text(data.get("label"))[:60] or None
+        ip = _client_ip(request)
 
-        if not email or not code or not hwid:
+        if not email or not hwid:
             return {"result": "fail"}
+        if OTP_REQUIRED and not code:
+            return {"result": "fail"}
+
+        now = datetime.now(timezone.utc)
+
+        # ── จำกัดอัตราการพยายามผูกเครื่องต่อ IP ───────────────────────────
+        # สำคัญเป็นพิเศษในโหมดไม่ใช้ OTP: อีเมลเป็นหลักฐานชิ้นเดียว ถ้าไม่มี
+        # ด่านนี้ ก็ไล่เดาอีเมลสมาชิกได้ไม่จำกัดโดยไม่มีอะไรขวาง
+        ip_rows = _activate_rows_since(ip, now - timedelta(hours=24))
+        if len(ip_rows) >= ACTIVATE_DAILY_LIMIT_IP:
+            _auth_log(email, "activate_denied", hwid, {"scope": "ip_day"}, ip)
+            return {"result": "rate_limited", "retry_after_minutes": 60 * 24}
+        if _count_since(ip_rows, now - timedelta(minutes=OTP_RATE_WINDOW_MINUTES)) >= ACTIVATE_RATE_LIMIT_IP:
+            _auth_log(email, "activate_denied", hwid, {"scope": "ip_window"}, ip)
+            return {"result": "rate_limited", "retry_after_minutes": OTP_RATE_WINDOW_MINUTES}
 
         member, err = _member_or_error(email)
         if err:
+            # บันทึกไว้ด้วย ไม่งั้นการไล่เดาอีเมลจะไม่ถูกนับเข้าเพดานข้างบน
+            _auth_log(email, "activate_denied", hwid, {"reason": err.get("result")}, ip)
             return err
 
         canon = _norm_email(member.get("email")) or email
 
-        res = (
-            supabase
-            .table("otp_codes")
-            .select("*")
-            .eq("email", canon)
-            .eq("purpose", "activate")
-            .is_("consumed_at", "null")
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        rows = res.data or []
-        if not rows:
-            return {"result": "no_otp"}
+        # ── ตรวจ OTP (เฉพาะตอนเปิดโหมดยืนยันทางอีเมล) ────────────────────
+        if OTP_REQUIRED:
+            res = (
+                supabase
+                .table("otp_codes")
+                .select("*")
+                .eq("email", canon)
+                .eq("purpose", "activate")
+                .is_("consumed_at", "null")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = res.data or []
+            if not rows:
+                _auth_log(canon, "activate_denied", hwid, {"reason": "no_otp"}, ip)
+                return {"result": "no_otp"}
 
-        otp_row = rows[0]
-        attempts = _as_int(otp_row.get("attempts"))
+            otp_row = rows[0]
+            attempts = _as_int(otp_row.get("attempts"))
 
-        if attempts >= OTP_MAX_ATTEMPTS:
-            return {"result": "too_many_attempts"}
+            if attempts >= OTP_MAX_ATTEMPTS:
+                return {"result": "too_many_attempts"}
 
-        expires_at = _parse_iso(otp_row.get("expires_at"))
-        if expires_at is None or expires_at < datetime.now(timezone.utc):
-            return {"result": "expired"}
+            expires_at = _parse_iso(otp_row.get("expires_at"))
+            if expires_at is None or expires_at < now:
+                return {"result": "expired"}
 
-        # OTP ผูกกับเครื่องที่ขอ -> อ่านรหัสจากอีเมลแล้วเอาไปกรอกบนเครื่องอื่นไม่ได้
-        if _as_text(otp_row.get("hwid_hash")) != hwid:
-            return {"result": "wrong_device"}
+            # OTP ผูกกับเครื่องที่ขอ -> อ่านรหัสจากอีเมลแล้วเอาไปกรอกบนเครื่องอื่นไม่ได้
+            if _as_text(otp_row.get("hwid_hash")) != hwid:
+                return {"result": "wrong_device"}
 
-        if not hmac.compare_digest(_as_text(otp_row.get("code_hash")), _hash_otp(canon, code)):
-            supabase.table("otp_codes").update({"attempts": attempts + 1}).eq("id", otp_row["id"]).execute()
-            _auth_log(canon, "otp_failed", hwid, {"attempts": attempts + 1})
-            return {"result": "bad_otp", "attempts_left": max(0, OTP_MAX_ATTEMPTS - attempts - 1)}
+            if not hmac.compare_digest(_as_text(otp_row.get("code_hash")), _hash_otp(canon, code)):
+                supabase.table("otp_codes").update({"attempts": attempts + 1}).eq("id", otp_row["id"]).execute()
+                _auth_log(canon, "otp_failed", hwid, {"attempts": attempts + 1}, ip)
+                return {"result": "bad_otp", "attempts_left": max(0, OTP_MAX_ATTEMPTS - attempts - 1)}
 
-        # ── OTP ถูกต้อง ──────────────────────────────────────────────────────
-        supabase.table("otp_codes").update({"consumed_at": now_iso()}).eq("id", otp_row["id"]).execute()
+            supabase.table("otp_codes").update({"consumed_at": now_iso()}).eq("id", otp_row["id"]).execute()
 
+        # ── ผ่านการตรวจแล้ว ─────────────────────────────────────────────
         devices = _active_devices(canon)
         mine = next((d for d in devices if _as_text(d.get("hwid_hash")) == hwid), None)
         slots = _device_slots(member)
@@ -1935,11 +2002,14 @@ def auth_activate(data: dict):
             slots_used = len(devices)
         else:
             if len(devices) >= slots:
-                _auth_log(canon, "denied_no_slot", hwid, {"slots": slots})
+                _auth_log(canon, "denied_no_slot", hwid, {"slots": slots}, ip)
                 return {
                     "result": "no_slot",
                     "slots": slots,
                     "devices": [_device_public(d) for d in devices],
+                    # บอกเกมว่าปลดเครื่องได้เองจากหน้านี้เลยไหม
+                    "can_release": not OTP_REQUIRED,
+                    "release_cooldown_days": DEVICE_RELEASE_COOLDOWN_DAYS,
                 }
             ins = supabase.table("devices").insert({
                 "email": canon,
@@ -1950,13 +2020,16 @@ def auth_activate(data: dict):
             device_id = (ins.data or [{}])[0].get("id")
             slots_used = len(devices) + 1
 
-        # ผ่าน OTP แล้ว = พิสูจน์ได้ว่าเป็นเจ้าของอีเมลจริง
-        if member.get("email_verified") is not True:
+        # ตั้ง email_verified เฉพาะตอนผ่าน OTP จริงเท่านั้น
+        # โหมดอีเมลอย่างเดียวไม่ได้พิสูจน์ว่าใครเป็นเจ้าของอีเมล การตั้งธงนี้
+        # จะทำให้ข้อมูลโกหก และถ้าวันหลังเปิด OTP ขึ้นมาจะแยกไม่ออกว่าใคร
+        # ยืนยันจริงแล้วบ้าง
+        if OTP_REQUIRED and member.get("email_verified") is not True:
             supabase.table("member_list").update(
                 {"email_verified": True}
             ).eq("email", member.get("email")).execute()
 
-        _auth_log(canon, "activated", hwid, {"device_id": device_id})
+        _auth_log(canon, "activated", hwid, {"device_id": device_id, "otp": OTP_REQUIRED}, ip)
 
         return {
             "result": "ok",
@@ -2087,19 +2160,37 @@ def auth_devices(data: dict):
 # Auth: Release a device (ผู้เล่นปลดเอง)
 # =====================
 @app.post("/auth/release-device")
-def auth_release_device(data: dict):
+def auth_release_device(data: dict, request: Request):
     try:
         token = _as_text(data.get("token"))
         hwid = _as_text(data.get("hwid_hash"))
         device_id = data.get("device_id")
+        ip = _client_ip(request)
 
-        payload = _decode_game_token(token, hwid) if token and hwid else None
-        if not payload:
-            return {"result": "invalid"}
-        if device_id is None:
+        if device_id is None or not hwid:
             return {"result": "fail"}
 
-        email = _norm_email(payload.get("sub"))
+        # ── ทางที่ 1: มี token อยู่แล้ว (เครื่องที่ล็อกอินผ่าน) ────────────
+        payload = _decode_game_token(token, hwid) if token else None
+        email = _norm_email(payload.get("sub")) if payload else ""
+        current_device_id = payload.get("did") if payload else None
+
+        # ── ทางที่ 2: ยังไม่มี token เพราะ slot เต็ม -> ยืนยันด้วยอีเมล ────
+        #
+        # ถ้าไม่มีทางนี้ คนที่เปลี่ยนเครื่องจะติดตาย: ปลด slot ต้องใช้ token
+        # แต่จะได้ token ต้องมี slot ว่างก่อน
+        #
+        # เปิดเฉพาะโหมดไม่ใช้ OTP เท่านั้น — โหมดนั้นอีเมลเป็นหลักฐานระดับ
+        # เดียวกับการล็อกอินอยู่แล้ว จึงไม่ได้ลดความปลอดภัยลง แต่ถ้าเปิด OTP
+        # ไว้ ช่องนี้จะกลายเป็นทางลัดข้าม OTP ทันที
+        if not email and not OTP_REQUIRED:
+            member, err = _member_or_error(_norm_email(data.get("email")))
+            if err:
+                return err
+            email = _norm_email(member.get("email"))
+
+        if not email:
+            return {"result": "invalid"}
 
         # ── cooldown: ปลดเองได้ทุก DEVICE_RELEASE_COOLDOWN_DAYS วัน ────────────
         # ไม่งั้นจะกลายเป็นช่องให้เวียนเครื่องไปเรื่อย ๆ จนไม่ต่างกับไม่มี slot
@@ -2127,12 +2218,14 @@ def auth_release_device(data: dict):
             "released_by": "self",
         }).eq("id", device_id).execute()
 
-        _auth_log(email, "released", hwid, {"device_id": device_id, "by": "self"})
+        _auth_log(email, "released", hwid, {"device_id": device_id, "by": "self"}, ip)
 
         return {
             "result": "ok",
             # ถ้าปลดเครื่องที่กำลังเล่นอยู่ token ปัจจุบันจะใช้ไม่ได้ทันที
-            "self_revoked": str(payload.get("did")) == str(device_id),
+            # (current_device_id เป็น None เมื่อปลดผ่านอีเมลจากเครื่องใหม่)
+            "self_revoked": current_device_id is not None
+                            and str(current_device_id) == str(device_id),
             "next_release_in_days": DEVICE_RELEASE_COOLDOWN_DAYS,
         }
 
